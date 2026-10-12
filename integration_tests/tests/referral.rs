@@ -9,7 +9,7 @@ use anyhow::Result;
 use common::transaction::LeeTransaction;
 use integration_tests::{
     TestContext, public_mention,
-    utils::{new_account, send, sync_private},
+    utils::{new_account, send, sync_private, wait_for_indexer_to_catch_up},
 };
 use key_protocol::key_management::secret_holders::SeedHolder;
 use lee::{AccountId, PrivateKey};
@@ -231,6 +231,9 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
     let payer = genesis_payer(&mut ctx);
     let program = deploy_referral(&mut ctx, payer.account_id).await?;
     fund_oracle(&mut ctx, payer.account_id).await?;
+    let mut config = ctx.wallet().config().clone();
+    config.indexer_addr = Some(format!("http://{}", ctx.indexer_addr()).parse()?);
+    ctx.wallet_mut().set_config(config);
 
     let (carol_key, carol_node) = node(3);
     let (alice_key, alice_node) = node(2);
@@ -301,33 +304,23 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
         .map(|(_id, state)| state)
         .collect();
     assert_eq!(
-        carol_holds.len(),
-        2,
-        "Carol holds an announcement and a forwarded credit"
-    );
-    assert!(
-        carol_holds.contains(&State::Child {
+        carol_holds,
+        vec![State::Child {
             node: alice_node,
             referrer: carol_node,
-        }),
-        "Alice announced herself to Carol when she registered"
-    );
-    assert!(
-        carol_holds.iter().any(|state| matches!(
-            *state,
-            State::Credit { recipient_node, amount: 1, .. } if recipient_node == carol_node
-        )),
-        "and forwarded what her own claim earned"
+        }],
+        "Carol holds Alice's announcement and no credit for an epoch she was inactive in"
     );
     assert_eq!(
         facade(&mut ctx, program).claimable(carol).await?,
-        2,
-        "an active child of her own and the credit it forwarded"
+        0,
+        "an inactive claimant earns nothing for her active child"
     );
-    assert_eq!(
-        claim(&mut ctx, program, carol, [3; 32]).await?,
-        2,
-        "the chain paid her for her child and for her child's child"
+    let carol_claim = current_claim(&mut ctx, program, carol).await?;
+    let carol_refused = facade(&mut ctx, program).submit([3; 32], carol_claim).await;
+    assert!(
+        carol_refused.is_err(),
+        "a claimant absent from the published epoch is refused: {carol_refused:?}"
     );
 
     assert_eq!(
@@ -344,7 +337,13 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
         "a participant with no active children has nothing to claim: {bob_refused_again:?}"
     );
 
-    publish(&mut ctx, program, 2, &[bob_node, dave_node]).await?;
+    publish(
+        &mut ctx,
+        program,
+        2,
+        &[alice_node, bob_node, carol_node, dave_node],
+    )
+    .await?;
 
     assert_eq!(
         facade(&mut ctx, program).claimable(alice).await?,
@@ -358,13 +357,13 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
     );
     assert_eq!(
         facade(&mut ctx, program).claimable(carol).await?,
-        1,
-        "Alice fell inactive, so only the credit she forwarded is left to claim"
+        2,
+        "her active child and the credit it forwarded, and nothing for the epoch she missed"
     );
     assert_eq!(
         claim(&mut ctx, program, carol, [6; 32]).await?,
-        3,
-        "the cascade pays her for activity she has no child of her own for"
+        2,
+        "the chain paid her for her child and for her child's child"
     );
 
     let carol_invites_dave = facade(&mut ctx, program).invitation(carol, carol_node)?;
@@ -384,7 +383,7 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
     );
     assert_eq!(
         claim(&mut ctx, program, carol, [7; 32]).await?,
-        4,
+        3,
         "the same epoch pays for the child announced after her claim"
     );
 
@@ -398,6 +397,35 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
     assert!(
         alice_refused.is_err(),
         "a second claim in the same epoch is refused: {alice_refused:?}"
+    );
+
+    publish(&mut ctx, program, 3, &[alice_node, bob_node, carol_node]).await?;
+    assert_eq!(
+        claim(&mut ctx, program, alice, [9; 32]).await?,
+        3,
+        "Bob is active in the third epoch"
+    );
+    let carol_stale = current_claim(&mut ctx, program, carol).await?;
+
+    publish(&mut ctx, program, 4, &[bob_node]).await?;
+    let carol_stale_refused = facade(&mut ctx, program)
+        .submit([10; 32], carol_stale)
+        .await;
+    assert!(
+        carol_stale_refused.is_err(),
+        "a claim built for a superseded publication is refused: {carol_stale_refused:?}"
+    );
+
+    wait_for_indexer_to_catch_up(&ctx).await?;
+    assert_eq!(
+        facade(&mut ctx, program).claimable(carol).await?,
+        1,
+        "the third epoch's credit outlives its publication although Carol is inactive now"
+    );
+    assert_eq!(
+        claim(&mut ctx, program, carol, [11; 32]).await?,
+        4,
+        "collected against the indexer's history of publications"
     );
 
     Ok(())
@@ -519,7 +547,7 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
 
     let mut sent = Vec::new();
     for (epoch, claimed, cashed_out) in [(1, [1; 32], [2; 32]), (2, [3; 32], [4; 32])] {
-        publish(&mut ctx, program, epoch, &[alice_node]).await?;
+        publish(&mut ctx, program, epoch, &[alice_node, carol_node]).await?;
         assert_eq!(
             claim(&mut ctx, program, carol, claimed).await?,
             1,
@@ -566,7 +594,7 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
     }
 
     import_oracle(&mut ctx)?;
-    publish(&mut ctx, program, 3, &[alice_node]).await?;
+    publish(&mut ctx, program, 3, &[alice_node, carol_node]).await?;
     assert_eq!(
         claim(&mut ctx, program, carol, [5; 32]).await?,
         1,
