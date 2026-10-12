@@ -434,6 +434,15 @@ mod tests {
         }
     }
 
+    const fn credit(amount: u128) -> State {
+        State::Credit {
+            recipient_node: NODE,
+            amount,
+            epoch: 1,
+            active_digest: [0; 32],
+        }
+    }
+
     #[test]
     fn claim_pays_each_active_child_once_per_publication_plus_its_credits() {
         let (a, b) = (NodeId::new([1; 32]), NodeId::new([2; 32]));
@@ -517,6 +526,47 @@ mod tests {
                 epoch: 1,
                 active_digest: [0; 32],
             }],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "claimant did not participate in the published epoch")]
+    fn claim_rejects_an_inactive_claimant() {
+        let a = NodeId::new([1; 32]);
+        let mut participant = Participant::new(NODE, None);
+        let _total = participant.claim(1, &BTreeSet::from([a]), &[child(a), credit(4)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "claimant did not participate in the published epoch")]
+    fn collecting_credits_rejects_an_inactive_claimant() {
+        let mut participant = Participant::new(NODE, None);
+        let _total = participant.collect_credits(&BTreeSet::new(), &[credit(4)]);
+    }
+
+    #[test]
+    fn collecting_credits_pays_only_the_credits() {
+        let a = NodeId::new([1; 32]);
+        let mut participant = Participant {
+            children: BTreeMap::from([(a, 0)]),
+            ..Participant::new(NODE, None)
+        };
+
+        assert_eq!(
+            participant.collect_credits(&BTreeSet::from([a, NODE]), &[credit(4), credit(3)]),
+            7
+        );
+        assert_eq!(participant.children, BTreeMap::from([(a, 0)]));
+        assert_eq!(participant.reward_balance, 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "note does not hold a credit")]
+    fn collecting_credits_rejects_an_announcement() {
+        let mut participant = Participant::new(NODE, None);
+        let _total = participant.collect_credits(
+            &BTreeSet::from([NODE]),
+            &[credit(1), child(NodeId::new([1; 32]))],
         );
     }
 }

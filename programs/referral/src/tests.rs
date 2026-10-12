@@ -423,6 +423,192 @@ fn a_referred_claim_requires_an_outgoing_credit_account() {
 }
 
 #[test]
+fn a_claim_forwards_nothing_to_an_inactive_referrer() {
+    let (_, me) = node(1);
+    let (_, parent) = node(2);
+    let (_, c) = node(3);
+    let participant_account = account(20);
+    let child_note = account(41);
+    let active = BTreeSet::from([c, me]);
+    let child = State::Child {
+        node: c,
+        referrer: me,
+    };
+    let claim = Claim {
+        epoch: 2,
+        active: active.clone(),
+        notes: vec![child.clone()],
+        total: 1,
+        referrer: Some(parent),
+    };
+
+    let plan = plan_for(
+        vec![
+            meta(participant_account, true),
+            meta(ORACLE_ACCOUNT_ID, false),
+            meta(child_note, false),
+        ],
+        Instruction::Claim(claim.clone()),
+    );
+
+    assert_eq!(
+        plan.output().effects,
+        vec![
+            ShardEffect::new(
+                &meta(ORACLE_ACCOUNT_ID, false),
+                &Effect::CheckEpoch {
+                    epoch: 2,
+                    active_digest: active_digest(&active),
+                },
+            ),
+            ShardEffect::new(&meta(child_note, false), &Effect::Consume(child)),
+            ShardEffect::new(
+                &meta(participant_account, true),
+                &Effect::Claim(claim.clone()),
+            ),
+        ]
+    );
+    let written = crate::apply(
+        Effect::Claim(claim),
+        &State::Participant(Participant::new(me, Some(parent))).to_data(),
+    )
+    .expect("Claim writes the participant");
+    assert_eq!(
+        State::decode(&written),
+        Some(State::Participant(Participant {
+            node: me,
+            referrer: Some(parent),
+            children: BTreeMap::from([(c, 2)]),
+            reward_balance: 1,
+        }))
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "a Claim names one account per note, then the outgoing credit account exactly when its referrer was active"
+)]
+fn a_claim_cannot_forward_to_an_inactive_referrer() {
+    let (_, me) = node(1);
+    let (_, parent) = node(2);
+    let participant_account = account(20);
+
+    let _plan = plan_for(
+        vec![
+            meta(participant_account, true),
+            meta(ORACLE_ACCOUNT_ID, false),
+            meta(account(43), false),
+        ],
+        Instruction::Claim(Claim {
+            active: BTreeSet::from([me]),
+            ..claim(1, Some(parent))
+        }),
+    );
+}
+
+#[test]
+fn a_credit_collection_forwards_under_its_earning_publication() {
+    let (_, me) = node(1);
+    let (_, parent) = node(2);
+    let (_, c) = node(3);
+    let participant_account = account(20);
+    let first_note = account(41);
+    let second_note = account(42);
+    let outgoing = account(43);
+    let active = BTreeSet::from([c, me, parent]);
+    let digest = active_digest(&active);
+    let credit = |amount| State::Credit {
+        recipient_node: me,
+        amount,
+        epoch: 2,
+        active_digest: digest,
+    };
+    let claim = Claim {
+        epoch: 2,
+        active,
+        notes: vec![credit(4), credit(3)],
+        total: 7,
+        referrer: Some(parent),
+    };
+
+    let plan = plan_for(
+        vec![
+            meta(participant_account, true),
+            meta(first_note, false),
+            meta(second_note, false),
+            meta(outgoing, false),
+        ],
+        Instruction::CollectCredits(claim.clone()),
+    );
+
+    assert_eq!(
+        plan.output().effects,
+        vec![
+            ShardEffect::new(&meta(first_note, false), &Effect::Consume(credit(4))),
+            ShardEffect::new(&meta(second_note, false), &Effect::Consume(credit(3))),
+            ShardEffect::new(
+                &meta(outgoing, false),
+                &Effect::Create(State::Credit {
+                    recipient_node: parent,
+                    amount: 7,
+                    epoch: 2,
+                    active_digest: digest,
+                }),
+            ),
+            ShardEffect::new(
+                &meta(participant_account, true),
+                &Effect::CollectCredits(claim.clone()),
+            ),
+        ]
+    );
+    let written = crate::apply(
+        Effect::CollectCredits(claim),
+        &State::Participant(Participant {
+            node: me,
+            referrer: Some(parent),
+            children: BTreeMap::from([(c, 1)]),
+            reward_balance: 5,
+        })
+        .to_data(),
+    )
+    .expect("a credit collection writes the participant");
+    assert_eq!(
+        State::decode(&written),
+        Some(State::Participant(Participant {
+            node: me,
+            referrer: Some(parent),
+            children: BTreeMap::from([(c, 1)]),
+            reward_balance: 12,
+        }))
+    );
+}
+
+#[test]
+#[should_panic(expected = "a credit was earned in another publication")]
+fn a_credit_collection_rejects_a_fabricated_active_set() {
+    let (_, me) = node(1);
+    let (_, c) = node(3);
+    let participant_account = account(20);
+    let published = BTreeSet::from([c]);
+
+    let _plan = plan_for(
+        vec![meta(participant_account, true), meta(account(41), false)],
+        Instruction::CollectCredits(Claim {
+            epoch: 2,
+            active: BTreeSet::from([c, me]),
+            notes: vec![State::Credit {
+                recipient_node: me,
+                amount: 1,
+                epoch: 2,
+                active_digest: active_digest(&published),
+            }],
+            total: 1,
+            referrer: None,
+        }),
+    );
+}
+
+#[test]
 #[should_panic(expected = "the claim total does not match")]
 fn claim_rejects_a_total_that_does_not_match() {
     let (_, me) = node(1);
