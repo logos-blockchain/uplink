@@ -4,8 +4,8 @@ use lee_core::{
 };
 pub use referral_core as core;
 use referral_core::{
-    Effect, Instruction, ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1, Registry,
-    State, active_digest, cash_out_receipt,
+    Claim, Effect, Instruction, ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1,
+    Registry, State, active_digest, cash_out_receipt,
 };
 
 pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
@@ -79,43 +79,29 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             };
             assert_authorized(participant);
             assert_registry(registry);
-            assert!(claim.total > 0, "nothing to claim");
-
-            let (notes, outgoing) = match claim.referrer {
-                Some(_) => {
-                    let (outgoing, notes) = rest
-                        .split_last()
-                        .expect("a referred Claim ends with its outgoing credit account");
-                    (notes, Some(outgoing))
-                }
-                None => (rest, None),
-            };
-            assert_eq!(
-                notes.len(),
-                claim.notes.len(),
-                "a Claim names one account per note, then the outgoing credit account exactly when its participant has a referrer"
-            );
-
+            let digest = active_digest(&claim.active);
             plan.effect(
                 registry,
                 &Effect::CheckEpoch {
                     epoch: claim.epoch,
-                    active_digest: active_digest(&claim.active),
+                    active_digest: digest,
                 },
             );
-            for (note, account) in claim.notes.iter().zip(notes) {
-                plan.effect(account, &Effect::Consume(note.clone()));
-            }
-            if let Some((parent, credit)) = claim.referrer.zip(outgoing) {
-                plan.effect(
-                    credit,
-                    &Effect::Create(State::Credit {
-                        recipient_node: parent,
-                        amount: claim.total,
-                    }),
-                );
-            }
-            plan.effect(participant, &Effect::Claim(claim));
+            plan_claim(&mut plan, participant, rest, digest, claim, Effect::Claim);
+        }
+        Instruction::CollectCredits(claim) => {
+            let [participant, rest @ ..] = input.accounts.as_slice() else {
+                panic!("CollectCredits requires the participant")
+            };
+            assert_authorized(participant);
+            plan_claim(
+                &mut plan,
+                participant,
+                rest,
+                active_digest(&claim.active),
+                claim,
+                Effect::CollectCredits,
+            );
         }
         Instruction::CashOut {
             node,
@@ -138,6 +124,60 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
         }
     }
     plan
+}
+
+fn plan_claim(
+    plan: &mut Plan,
+    participant: &AccountMeta,
+    rest: &[AccountMeta],
+    digest: [u8; 32],
+    claim: Claim,
+    effect: fn(Claim) -> Effect,
+) {
+    assert!(claim.total > 0, "nothing to claim");
+    let forward_to = claim.forward_to();
+    let (notes, outgoing) = match forward_to {
+        Some(_) => {
+            let (outgoing, notes) = rest
+                .split_last()
+                .expect("a forwarding Claim ends with its outgoing credit account");
+            (notes, Some(outgoing))
+        }
+        None => (rest, None),
+    };
+    assert_eq!(
+        notes.len(),
+        claim.notes.len(),
+        "a Claim names one account per note, then the outgoing credit account exactly when its referrer was active"
+    );
+
+    for (note, account) in claim.notes.iter().zip(notes) {
+        if let State::Credit {
+            epoch,
+            active_digest: earned_under,
+            ..
+        } = *note
+        {
+            assert_eq!(
+                (epoch, earned_under),
+                (claim.epoch, digest),
+                "a credit was earned in another publication"
+            );
+        }
+        plan.effect(account, &Effect::Consume(note.clone()));
+    }
+    if let Some((parent, credit)) = forward_to.zip(outgoing) {
+        plan.effect(
+            credit,
+            &Effect::Create(State::Credit {
+                recipient_node: parent,
+                amount: claim.total,
+                epoch: claim.epoch,
+                active_digest: digest,
+            }),
+        );
+    }
+    plan.effect(participant, &effect(claim));
 }
 
 #[must_use]
@@ -178,19 +218,12 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
             assert!(pre_data.is_empty(), "account already holds referral state");
             Some(state.to_data())
         }
-        Effect::Claim(claim) => {
-            let mut participant = decode_participant(pre_data);
-            assert_eq!(
-                participant.referrer, claim.referrer,
-                "the claim names another referrer"
-            );
-            assert_eq!(
-                participant.claim(claim.epoch, &claim.active, &claim.notes),
-                claim.total,
-                "the claim total does not match"
-            );
-            Some(State::Participant(participant).to_data())
-        }
+        Effect::Claim(claim) => Some(settle(pre_data, &claim, |participant| {
+            participant.claim(claim.epoch, &claim.active, &claim.notes)
+        })),
+        Effect::CollectCredits(claim) => Some(settle(pre_data, &claim, |participant| {
+            participant.collect_credits(&claim.active, &claim.notes)
+        })),
         Effect::Consume(note) => {
             assert_eq!(
                 decode(pre_data),
@@ -210,6 +243,24 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
             Some(State::Participant(participant).to_data())
         }
     }
+}
+
+fn settle(
+    pre_data: &ShardData,
+    claim: &Claim,
+    transition: impl FnOnce(&mut Participant) -> u128,
+) -> ShardData {
+    let mut participant = decode_participant(pre_data);
+    assert_eq!(
+        participant.referrer, claim.referrer,
+        "the claim names another referrer"
+    );
+    assert_eq!(
+        transition(&mut participant),
+        claim.total,
+        "the claim total does not match"
+    );
+    State::Participant(participant).to_data()
 }
 
 fn decode(pre_data: &ShardData) -> State {

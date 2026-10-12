@@ -100,6 +100,7 @@ impl Participant {
 
     #[must_use]
     pub fn claim(&mut self, epoch: u32, active: &BTreeSet<NodeId>, notes: &[State]) -> u128 {
+        self.assert_active(active);
         let mut total: u128 = 0;
         for note in notes {
             match *note {
@@ -107,16 +108,9 @@ impl Participant {
                     assert_eq!(referrer, self.node, "child is announced to another node");
                     self.children.entry(node).or_insert(0);
                 }
-                State::Credit {
-                    recipient_node,
-                    amount,
-                } => {
-                    assert_eq!(
-                        recipient_node, self.node,
-                        "credit is addressed to another node"
-                    );
+                State::Credit { .. } => {
                     total = total
-                        .checked_add(amount)
+                        .checked_add(self.credit(note))
                         .expect("credit total fits in u128");
                 }
                 State::Registry(_) | State::Participant(_) | State::CashOut { .. } => {
@@ -130,6 +124,44 @@ impl Participant {
                 total = total.checked_add(1).expect("claim total fits in u128");
             }
         }
+        self.add_reward(total)
+    }
+
+    #[must_use]
+    pub fn collect_credits(&mut self, active: &BTreeSet<NodeId>, notes: &[State]) -> u128 {
+        self.assert_active(active);
+        let total = notes
+            .iter()
+            .map(|note| self.credit(note))
+            .try_fold(0, u128::checked_add)
+            .expect("credit total fits in u128");
+        self.add_reward(total)
+    }
+
+    fn assert_active(&self, active: &BTreeSet<NodeId>) {
+        assert!(
+            active.contains(&self.node),
+            "claimant did not participate in the published epoch"
+        );
+    }
+
+    fn credit(&self, note: &State) -> u128 {
+        let State::Credit {
+            recipient_node,
+            amount,
+            ..
+        } = *note
+        else {
+            panic!("note does not hold a credit")
+        };
+        assert_eq!(
+            recipient_node, self.node,
+            "credit is addressed to another node"
+        );
+        amount
+    }
+
+    const fn add_reward(&mut self, total: u128) -> u128 {
         self.reward_balance = self
             .reward_balance
             .checked_add(total)
@@ -149,6 +181,8 @@ pub enum State {
     Credit {
         recipient_node: NodeId,
         amount: u128,
+        epoch: u32,
+        active_digest: [u8; 32],
     },
     CashOut {
         points: u128,
@@ -224,6 +258,13 @@ pub struct Claim {
     pub referrer: Option<NodeId>,
 }
 
+impl Claim {
+    #[must_use]
+    pub fn forward_to(&self) -> Option<NodeId> {
+        self.referrer.filter(|node| self.active.contains(node))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Instruction {
     Register {
@@ -237,6 +278,7 @@ pub enum Instruction {
         active: BTreeSet<NodeId>,
     },
     Claim(Claim),
+    CollectCredits(Claim),
     CashOut {
         node: NodeId,
         points: u128,
@@ -260,6 +302,7 @@ pub enum Effect {
     },
     Create(State),
     Claim(Claim),
+    CollectCredits(Claim),
     Consume(State),
     CashOutBurn {
         node: NodeId,
@@ -395,10 +438,12 @@ mod tests {
     fn claim_pays_each_active_child_once_per_publication_plus_its_credits() {
         let (a, b) = (NodeId::new([1; 32]), NodeId::new([2; 32]));
         let mut participant = Participant::new(NODE, None);
-        let first_active = BTreeSet::from([a]);
+        let first_active = BTreeSet::from([a, NODE]);
         let credit = State::Credit {
             recipient_node: NODE,
             amount: 4,
+            epoch: 1,
+            active_digest: active_digest(&first_active),
         };
 
         assert_eq!(
@@ -407,7 +452,7 @@ mod tests {
         );
         assert_eq!(participant.children, BTreeMap::from([(a, 1), (b, 0)]));
         assert_eq!(participant.claim(1, &first_active, &[child(a)]), 0);
-        assert_eq!(participant.claim(2, &BTreeSet::from([a, b]), &[]), 2);
+        assert_eq!(participant.claim(2, &BTreeSet::from([a, b, NODE]), &[]), 2);
         assert_eq!(participant.claim(1, &first_active, &[]), 0);
         assert_eq!(participant.reward_balance, 7);
     }
@@ -419,7 +464,7 @@ mod tests {
         let mut participant = Participant::new(NODE, None);
         let _total = participant.claim(
             1,
-            &BTreeSet::new(),
+            &BTreeSet::from([NODE]),
             &[State::Child {
                 node: other,
                 referrer: other,
@@ -455,7 +500,7 @@ mod tests {
     #[should_panic(expected = "note does not hold a child or a credit")]
     fn claim_rejects_a_cash_out_receipt_as_a_note() {
         let mut participant = Participant::new(NODE, None);
-        let _total = participant.claim(1, &BTreeSet::new(), &[State::CashOut { points: 3 }]);
+        let _total = participant.claim(1, &BTreeSet::from([NODE]), &[State::CashOut { points: 3 }]);
     }
 
     #[test]
@@ -465,10 +510,12 @@ mod tests {
         let mut participant = Participant::new(NODE, None);
         let _total = participant.claim(
             1,
-            &BTreeSet::new(),
+            &BTreeSet::from([NODE]),
             &[State::Credit {
                 recipient_node: other,
                 amount: 1,
+                epoch: 1,
+                active_digest: [0; 32],
             }],
         );
     }

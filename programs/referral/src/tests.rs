@@ -284,7 +284,8 @@ fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
     let child_note = account(41);
     let credit_note = account(42);
     let outgoing = account(43);
-    let active = BTreeSet::from([c]);
+    let active = BTreeSet::from([c, me, parent]);
+    let digest = active_digest(&active);
     let child = State::Child {
         node: c,
         referrer: me,
@@ -292,10 +293,12 @@ fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
     let credit = State::Credit {
         recipient_node: me,
         amount: 4,
+        epoch: 2,
+        active_digest: digest,
     };
     let check_epoch = Effect::CheckEpoch {
         epoch: 2,
-        active_digest: active_digest(&active),
+        active_digest: digest,
     };
 
     let claim = Claim {
@@ -328,6 +331,8 @@ fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
                 &Effect::Create(State::Credit {
                     recipient_node: parent,
                     amount: 5,
+                    epoch: 2,
+                    active_digest: digest,
                 }),
             ),
             ShardEffect::new(
@@ -400,7 +405,7 @@ fn claim_rejects_an_account_that_is_not_the_registry() {
 }
 
 #[test]
-#[should_panic(expected = "a referred Claim ends with its outgoing credit account")]
+#[should_panic(expected = "a forwarding Claim ends with its outgoing credit account")]
 fn a_referred_claim_requires_an_outgoing_credit_account() {
     let (_, parent) = node(2);
     let participant_account = account(20);
@@ -410,7 +415,10 @@ fn a_referred_claim_requires_an_outgoing_credit_account() {
             meta(participant_account, true),
             meta(ORACLE_ACCOUNT_ID, false),
         ],
-        Instruction::Claim(claim(1, Some(parent))),
+        Instruction::Claim(Claim {
+            active: BTreeSet::from([parent]),
+            ..claim(1, Some(parent))
+        }),
     );
 }
 
@@ -420,7 +428,10 @@ fn claim_rejects_a_total_that_does_not_match() {
     let (_, me) = node(1);
 
     let _written = crate::apply(
-        Effect::Claim(claim(1, None)),
+        Effect::Claim(Claim {
+            active: BTreeSet::from([me]),
+            ..claim(1, None)
+        }),
         &State::Participant(Participant::new(me, None)).to_data(),
     );
 }
@@ -446,10 +457,14 @@ fn consume_rejects_a_note_that_differs_from_the_claim() {
         Effect::Consume(State::Credit {
             recipient_node: me,
             amount: 1,
+            epoch: 1,
+            active_digest: [0; 32],
         }),
         &State::Credit {
             recipient_node: me,
             amount: 2,
+            epoch: 1,
+            active_digest: [0; 32],
         }
         .to_data(),
     );

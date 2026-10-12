@@ -880,6 +880,7 @@ fn is_superseded(
                 Effect::Publish { .. }
                 | Effect::Create(_)
                 | Effect::Claim(_)
+                | Effect::CollectCredits(_)
                 | Effect::Consume(_)
                 | Effect::CashOutBurn { .. } => false,
             }
@@ -1002,6 +1003,8 @@ mod tests {
         let note = State::Credit {
             recipient_node: NodeId::new([1; 32]),
             amount: 1,
+            epoch: 1,
+            active_digest: [0; 32],
         }
         .to_data();
         let empty = ShardData::empty();

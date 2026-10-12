@@ -301,10 +301,10 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
         "Alice announced herself to Carol when she registered"
     );
     assert!(
-        carol_holds.contains(&State::Credit {
-            recipient_node: carol_node,
-            amount: 1,
-        }),
+        carol_holds.iter().any(|state| matches!(
+            *state,
+            State::Credit { recipient_node, amount: 1, .. } if recipient_node == carol_node
+        )),
         "and forwarded what her own claim earned"
     );
     assert_eq!(
