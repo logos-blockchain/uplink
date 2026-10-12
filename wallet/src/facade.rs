@@ -659,23 +659,25 @@ impl<'wallet> Referral<'wallet> {
             return Ok(recorded.status);
         }
 
-        let view = self
+        let registry = self
             .wallet
-            .observe_transaction(
-                &[ProgramShardSelector::new(
-                    ORACLE_ACCOUNT_ID,
-                    recorded.program_account,
-                )],
-                &effect_commitments(&recorded.transaction),
-            )
+            .get_account_view(ProgramShardSelector::new(
+                ORACLE_ACCOUNT_ID,
+                recorded.program_account,
+            ))
+            .await
+            .map_err(ExecutionFailureKind::SequencerError)?;
+        let settled = self
+            .wallet
+            .commitments_settled(&effect_commitments(&recorded.transaction))
             .await
             .map_err(ExecutionFailureKind::SequencerError)?;
 
-        if view.effect_settled {
+        if settled {
             return self.set_status(reference, SubmissionStatus::Settled);
         }
 
-        if self.is_outspent(&recorded) || is_superseded(&recorded, &view.views[0])? {
+        if self.is_outspent(&recorded) || is_superseded(&recorded, &registry)? {
             return self.set_status(reference, SubmissionStatus::Rejected);
         }
 
