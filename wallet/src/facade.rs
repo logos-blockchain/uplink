@@ -1163,32 +1163,118 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn reconciliation_reads_the_recorded_deployment() {
-        let ours = AccountId::new([1; 32]);
-        let other = AccountId::new([2; 32]);
-        let active = BTreeSet::from([NodeId::new([9; 32])]);
-
+    fn private_effect(program_account: AccountId, effect: &Effect) -> LeeTransaction {
         let message = Message {
             public_actions: vec![PublicActionWithID {
                 account_id: ORACLE_ACCOUNT_ID,
                 effects: vec![DeferredPublicEffect {
-                    program_account_id: ours,
-                    shard_program_account_id: ours,
-                    data: borsh::to_vec(&Effect::CheckEpoch {
-                        epoch: 1,
-                        active_digest: active_digest(&active),
-                    })
-                    .unwrap(),
+                    program_account_id: program_account,
+                    shard_program_account_id: program_account,
+                    data: borsh::to_vec(effect).unwrap(),
                 }],
             }],
             ..Message::default()
         };
         let witness_set = WitnessSet::for_message(&message, Proof::from_inner(Vec::new()), &[]);
-        let transaction = LeeTransaction::PrivacyPreserving(PrivacyPreservingTransaction::new(
-            message,
-            witness_set,
-        ));
+        LeeTransaction::PrivacyPreserving(PrivacyPreservingTransaction::new(message, witness_set))
+    }
+
+    fn public_call(program_account: AccountId, instruction: Instruction) -> LeeTransaction {
+        let message = lee::public_transaction::Message::try_new(
+            program_account,
+            vec![ProgramShardSelector::new(
+                ORACLE_ACCOUNT_ID,
+                program_account,
+            )],
+            vec![lee_core::account::Nonce::default()],
+            instruction,
+        )
+        .unwrap();
+        let key = lee::PrivateKey::new_os_random();
+        let witness_set = lee::public_transaction::WitnessSet::for_message(&message, &[&key]);
+        LeeTransaction::Public(lee::PublicTransaction::new(message, witness_set))
+    }
+
+    #[test]
+    fn publications_are_read_from_this_programs_history_by_epoch_and_digest() {
+        let ours = AccountId::new([1; 32]);
+        let other = AccountId::new([2; 32]);
+        let first = BTreeSet::from([NodeId::new([7; 32])]);
+        let corrected = BTreeSet::from([NodeId::new([8; 32])]);
+        let history = [
+            public_call(
+                ours,
+                Instruction::Publish {
+                    epoch: 1,
+                    active: first.clone(),
+                },
+            ),
+            public_call(
+                other,
+                Instruction::Publish {
+                    epoch: 1,
+                    active: BTreeSet::new(),
+                },
+            ),
+            public_call(
+                ours,
+                Instruction::CashOut {
+                    node: NodeId::new([7; 32]),
+                    points: 1,
+                    blinding_factor: [0; 32],
+                },
+            ),
+            private_effect(
+                ours,
+                &Effect::CheckEpoch {
+                    epoch: 1,
+                    active_digest: active_digest(&first),
+                },
+            ),
+            private_effect(
+                ours,
+                &Effect::Publish {
+                    epoch: 1,
+                    active: corrected.clone(),
+                },
+            ),
+        ];
+        let store = ReferralStore {
+            publications: history
+                .iter()
+                .filter_map(|transaction| published(transaction, ours))
+                .collect(),
+            ..ReferralStore::default()
+        };
+
+        assert_eq!(store.publications.len(), 2);
+        assert_eq!(
+            store.publication(ours, 1, active_digest(&first)),
+            Some(&first)
+        );
+        assert_eq!(
+            store.publication(ours, 1, active_digest(&corrected)),
+            Some(&corrected)
+        );
+        assert_eq!(store.publication(ours, 2, active_digest(&first)), None);
+        assert_eq!(
+            store.publication(other, 1, active_digest(&BTreeSet::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn reconciliation_reads_the_recorded_deployment() {
+        let ours = AccountId::new([1; 32]);
+        let other = AccountId::new([2; 32]);
+        let active = BTreeSet::from([NodeId::new([9; 32])]);
+        let transaction = private_effect(
+            ours,
+            &Effect::CheckEpoch {
+                epoch: 1,
+                active_digest: active_digest(&active),
+            },
+        );
 
         let recorded = PendingOperation {
             reference: [0; 32],
