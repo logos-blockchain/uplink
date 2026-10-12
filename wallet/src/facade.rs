@@ -7,7 +7,7 @@ use lee::{
     privacy_preserving_transaction::circuit::ProgramWithDependencies, program::Program,
 };
 use lee_core::{
-    Commitment, NullifierSecretKey, PrivateAccountKind,
+    NullifierSecretKey, PrivateAccountKind,
     account::{ProgramShardSelector, ShardData},
     program::InstructionData,
 };
@@ -579,20 +579,21 @@ impl<'wallet> Referral<'wallet> {
             .referral()
             .operation(reference)
             .cloned();
-        if let Some(recorded) = recorded.as_ref() {
+        if let Some(recorded) = recorded {
             if recorded.program_account != program_account || recorded.operation != operation {
                 return Err(conflict(
                     "this reference was already used for a different deployment or operation",
                 ));
             }
+            let hash = HashType(recorded.transaction.hash());
             let status = self.reconcile(reference).await?;
             match status {
                 SubmissionStatus::Settled => {
-                    return Ok((recorded.transaction.hash(), status));
+                    return Ok((hash, status));
                 }
                 SubmissionStatus::Pending => {
-                    self.rebroadcast(recorded.transaction.clone()).await?;
-                    return Ok((recorded.transaction.hash(), SubmissionStatus::Pending));
+                    self.rebroadcast(recorded.transaction).await?;
+                    return Ok((hash, SubmissionStatus::Pending));
                 }
                 SubmissionStatus::Rejected => {}
             }
@@ -669,7 +670,7 @@ impl<'wallet> Referral<'wallet> {
             .map_err(ExecutionFailureKind::SequencerError)?;
         let settled = self
             .wallet
-            .commitments_settled(&effect_commitments(&recorded.transaction))
+            .commitments_settled(&recorded.transaction.message().commitments())
             .await
             .map_err(ExecutionFailureKind::SequencerError)?;
 
@@ -723,7 +724,7 @@ impl<'wallet> Referral<'wallet> {
             reference,
             program_account: self.program_account(),
             operation,
-            transaction: LeeTransaction::PrivacyPreserving(built.transaction),
+            transaction: built.transaction,
             input_commitments: built.input_commitments,
             status: SubmissionStatus::Pending,
         })
@@ -937,10 +938,10 @@ impl<'wallet> Referral<'wallet> {
 
     async fn rebroadcast(
         &self,
-        transaction: LeeTransaction,
+        transaction: PrivacyPreservingTransaction,
     ) -> Result<HashType, ExecutionFailureKind> {
         self.wallet
-            .submit_privacy_preserving_transaction(recorded_private(&transaction).clone())
+            .submit_privacy_preserving_transaction(transaction)
             .await
     }
 
@@ -1043,19 +1044,13 @@ fn decode_registry(
     }
 }
 
-fn recorded_private(transaction: &LeeTransaction) -> &PrivacyPreservingTransaction {
-    match transaction {
-        LeeTransaction::PrivacyPreserving(private) => private,
-        LeeTransaction::Public(_) => unreachable!("referral records only private operations"),
-    }
-}
-
 fn is_superseded(
     recorded: &PendingOperation,
     registry: &Account,
 ) -> Result<bool, ExecutionFailureKind> {
     let registry = decode_registry(registry, recorded.program_account)?;
-    Ok(recorded_private(&recorded.transaction)
+    Ok(recorded
+        .transaction
         .message()
         .public_actions
         .iter()
@@ -1132,10 +1127,6 @@ fn cash_out_transition(
     (status != recorded).then_some(status)
 }
 
-fn effect_commitments(transaction: &LeeTransaction) -> Vec<Commitment> {
-    recorded_private(transaction).message().commitments()
-}
-
 fn conflict(message: &str) -> ExecutionFailureKind {
     ExecutionFailureKind::TransactionBuildError(lee::error::LeeError::InvalidInput(
         message.to_owned(),
@@ -1165,7 +1156,7 @@ mod tests {
 
     use super::*;
 
-    fn private_effect(program_account: AccountId, effect: &Effect) -> LeeTransaction {
+    fn private_effect(program_account: AccountId, effect: &Effect) -> PrivacyPreservingTransaction {
         let message = Message {
             public_actions: vec![PublicActionWithID {
                 account_id: ORACLE_ACCOUNT_ID,
@@ -1178,7 +1169,7 @@ mod tests {
             ..Message::default()
         };
         let witness_set = WitnessSet::for_message(&message, Proof::from_inner(Vec::new()), &[]);
-        LeeTransaction::PrivacyPreserving(PrivacyPreservingTransaction::new(message, witness_set))
+        PrivacyPreservingTransaction::new(message, witness_set)
     }
 
     fn public_call(program_account: AccountId, instruction: Instruction) -> LeeTransaction {
@@ -1226,20 +1217,20 @@ mod tests {
                     blinding_factor: [0; 32],
                 },
             ),
-            private_effect(
+            LeeTransaction::PrivacyPreserving(private_effect(
                 ours,
                 &Effect::CheckEpoch {
                     epoch: 1,
                     active_digest: active_digest(&first),
                 },
-            ),
-            private_effect(
+            )),
+            LeeTransaction::PrivacyPreserving(private_effect(
                 ours,
                 &Effect::Publish {
                     epoch: 1,
                     active: corrected.clone(),
                 },
-            ),
+            )),
         ];
         let store = ReferralStore {
             publications: history

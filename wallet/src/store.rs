@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::transaction::LeeTransaction;
-use lee::AccountId;
+use lee::{AccountId, PrivacyPreservingTransaction};
 use lee_core::{Commitment, Identifier};
 use rand::{RngCore as _, rngs::OsRng};
 use referral_core::{Invitation, NodeId, active_digest, ed25519_dalek::Signature};
@@ -71,7 +70,8 @@ pub struct PendingOperation {
     pub reference: [u8; 32],
     pub program_account: AccountId,
     pub operation: OperationKind,
-    pub transaction: LeeTransaction,
+    #[serde(with = "common::borsh_base64")]
+    pub transaction: PrivacyPreservingTransaction,
     pub input_commitments: Vec<(AccountId, Commitment)>,
     pub status: SubmissionStatus,
 }

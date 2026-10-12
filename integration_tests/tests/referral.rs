@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use common::transaction::LeeTransaction;
 use integration_tests::{
     TestContext, public_mention,
     utils::{new_account, send, sync_private, wait_for_indexer_to_catch_up},
@@ -180,10 +179,7 @@ async fn cash_out(
         .referral()
         .operation(reference)
         .ok_or_else(|| anyhow::anyhow!("a submitted cash out is recorded"))?;
-    let LeeTransaction::PrivacyPreserving(sent) = &recorded.transaction else {
-        anyhow::bail!("a cash out is a privacy-preserving transaction");
-    };
-    let [receipt] = sent.message().public_actions.as_slice() else {
+    let [receipt] = recorded.transaction.message().public_actions.as_slice() else {
         anyhow::bail!("a cash out mentions exactly one public account");
     };
     Ok(receipt.account_id)
