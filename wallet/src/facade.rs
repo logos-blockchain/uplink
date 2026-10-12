@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use common::{HashType, transaction::LeeTransaction};
+use common::HashType;
 use hkdf::Hkdf;
+use indexer_service_protocol::Transaction as IndexedTransaction;
 use lee::{
     Account, AccountId, PrivacyPreservingTransaction,
     privacy_preserving_transaction::circuit::ProgramWithDependencies, program::Program,
@@ -283,25 +284,31 @@ impl<'wallet> Referral<'wallet> {
         &self,
         participant: AccountId,
     ) -> Result<Vec<(AccountId, State)>, ExecutionFailureKind> {
-        let me = self.participant(participant)?;
-        let npk = self.found(participant)?.key_chain.nullifier_public_key;
+        let program_account = self.program_account();
+        let found = self.found(participant)?;
+        let me = decode_participant(found.account, program_account)?;
+        let npk = found.key_chain.nullifier_public_key;
         Ok(self
             .wallet
             .storage()
             .key_chain()
-            .private_account_key_chains()
-            .filter(|(id, key_chain, _index)| {
-                *id != participant && key_chain.nullifier_public_key == npk
-            })
-            .filter_map(|(id, _key_chain, _index)| {
-                let found = self.found(id).ok()?;
-                let state = State::decode(found.account.data.shard(self.program_account()))?;
+            .private_accounts()
+            .filter(|note| note.key_chain.nullifier_public_key == npk)
+            .filter_map(|note| {
+                let state = State::decode(note.account.data.shard(program_account))?;
                 let addressed = match state {
                     State::Child { referrer, .. } => referrer == me.node,
                     State::Credit { recipient_node, .. } => recipient_node == me.node,
                     State::Registry(_) | State::Participant(_) | State::CashOut { .. } => false,
                 };
-                addressed.then_some((id, state))
+                addressed.then(|| {
+                    let id = AccountId::for_private_account(
+                        &note.key_chain.nullifier_public_key,
+                        &note.key_chain.viewing_public_key,
+                        note.kind,
+                    );
+                    (id, state)
+                })
             })
             .collect())
     }
@@ -333,10 +340,10 @@ impl<'wallet> Referral<'wallet> {
         &mut self,
         participant: AccountId,
     ) -> Result<Vec<(OperationKind, u128)>, ExecutionFailureKind> {
-        let node = self.participant(participant)?.node;
+        let claimant = self.participant(participant)?;
         let registry = self.registry().await?;
         let current = (registry.epoch, active_digest(&registry.active));
-        let mut groups = BTreeMap::from([(current, Vec::new())]);
+        let mut groups = BTreeMap::from([(current, (Vec::new(), Vec::new()))]);
         for (id, state) in self.notes(participant)? {
             let group = if let State::Credit {
                 epoch,
@@ -348,19 +355,19 @@ impl<'wallet> Referral<'wallet> {
             } else {
                 current
             };
-            groups.entry(group).or_default().push(id);
+            let (ids, states) = groups.entry(group).or_default();
+            ids.push(id);
+            states.push(state);
         }
 
         let mut batches = Vec::new();
-        for ((epoch, digest), notes) in groups {
+        for ((epoch, digest), (notes, states)) in groups {
             let collects = (epoch, digest) != current;
             let active = self.publication(&registry, epoch, digest).await?;
-            if !active.contains(&node) {
+            if !active.contains(&claimant.node) {
                 continue;
             }
-            let total = self
-                .claim_for(participant, &notes, epoch, digest, collects, active)?
-                .total;
+            let total = claim_for(claimant.clone(), states, epoch, digest, collects, active)?.total;
             if total == 0 {
                 continue;
             }
@@ -447,62 +454,6 @@ impl<'wallet> Referral<'wallet> {
                 }
             }
             store.history_offsets.insert(program_account, offset);
-        })
-    }
-
-    fn claim_for(
-        &self,
-        participant: AccountId,
-        notes: &[AccountId],
-        epoch: u32,
-        digest: [u8; 32],
-        collects: bool,
-        active: BTreeSet<NodeId>,
-    ) -> Result<Claim, ExecutionFailureKind> {
-        let mut claimant = self.participant(participant)?;
-        if !active.contains(&claimant.node) {
-            return Err(conflict(
-                "the participant was not active in that publication",
-            ));
-        }
-        let listed = self.notes(participant)?;
-        let states: Vec<State> = notes
-            .iter()
-            .map(|note| {
-                listed
-                    .iter()
-                    .find_map(|(id, state)| (id == note).then(|| state.clone()))
-                    .ok_or_else(|| conflict("this note is not addressed to the participant"))
-            })
-            .collect::<Result<_, _>>()?;
-        for state in &states {
-            let belongs = match *state {
-                State::Credit {
-                    epoch: earned,
-                    active_digest: earned_under,
-                    ..
-                } => (earned, earned_under) == (epoch, digest),
-                State::Child { .. } => !collects,
-                State::Registry(_) | State::Participant(_) | State::CashOut { .. } => false,
-            };
-            if !belongs {
-                return Err(conflict(
-                    "this note does not belong to the claimed publication",
-                ));
-            }
-        }
-        let referrer = claimant.referrer;
-        let total = if collects {
-            claimant.collect_credits(&active, &states)
-        } else {
-            claimant.claim(epoch, &active, &states)
-        };
-        Ok(Claim {
-            epoch,
-            active,
-            notes: states,
-            total,
-            referrer,
         })
     }
 
@@ -792,7 +743,24 @@ impl<'wallet> Referral<'wallet> {
             ));
         }
         let active = self.publication(&registry, *epoch, *digest).await?;
-        let claim = self.claim_for(*participant, notes, *epoch, *digest, collects, active)?;
+        let listed = self.notes(*participant)?;
+        let states = notes
+            .iter()
+            .map(|note| {
+                listed
+                    .iter()
+                    .find_map(|(id, state)| (id == note).then(|| state.clone()))
+                    .ok_or_else(|| conflict("this note is not addressed to the participant"))
+            })
+            .collect::<Result<_, _>>()?;
+        let claim = claim_for(
+            self.participant(*participant)?,
+            states,
+            *epoch,
+            *digest,
+            collects,
+            active,
+        )?;
         if claim.total == 0 {
             return Err(conflict("nothing to claim"));
         }
@@ -1044,6 +1012,50 @@ fn decode_registry(
     }
 }
 
+fn claim_for(
+    mut claimant: Participant,
+    states: Vec<State>,
+    epoch: u32,
+    digest: [u8; 32],
+    collects: bool,
+    active: BTreeSet<NodeId>,
+) -> Result<Claim, ExecutionFailureKind> {
+    if !active.contains(&claimant.node) {
+        return Err(conflict(
+            "the participant was not active in that publication",
+        ));
+    }
+    for state in &states {
+        let belongs = match *state {
+            State::Credit {
+                epoch: earned,
+                active_digest: earned_under,
+                ..
+            } => (earned, earned_under) == (epoch, digest),
+            State::Child { .. } => !collects,
+            State::Registry(_) | State::Participant(_) | State::CashOut { .. } => false,
+        };
+        if !belongs {
+            return Err(conflict(
+                "this note does not belong to the claimed publication",
+            ));
+        }
+    }
+    let referrer = claimant.referrer;
+    let total = if collects {
+        claimant.collect_credits(&active, &states)
+    } else {
+        claimant.claim(epoch, &active, &states)
+    };
+    Ok(Claim {
+        epoch,
+        active,
+        notes: states,
+        total,
+        referrer,
+    })
+}
+
 fn is_superseded(
     recorded: &PendingOperation,
     registry: &Account,
@@ -1076,27 +1088,27 @@ fn is_superseded(
         }))
 }
 
-fn published(transaction: &LeeTransaction, program_account: AccountId) -> Option<Publication> {
+fn published(transaction: &IndexedTransaction, program_account: AccountId) -> Option<Publication> {
+    let program = *program_account.value();
     let (epoch, active) = match transaction {
-        LeeTransaction::Public(public) => {
-            let message = public.message();
-            if message.program_account_id != program_account {
+        IndexedTransaction::Public(public) => {
+            if public.message.program_account_id.value != program {
                 return None;
             }
             let Instruction::Publish { epoch, active } =
-                borsh::from_slice(&message.instruction_data).ok()?
+                borsh::from_slice(&public.message.instruction_data).ok()?
             else {
                 return None;
             };
             (epoch, active)
         }
-        LeeTransaction::PrivacyPreserving(private) => private
-            .message()
+        IndexedTransaction::PrivacyPreserving(private) => private
+            .message
             .public_actions
             .iter()
-            .filter(|action| action.account_id == ORACLE_ACCOUNT_ID)
+            .filter(|action| action.account_id.value == *ORACLE_ACCOUNT_ID.value())
             .flat_map(|action| &action.effects)
-            .filter(|effect| effect.program_account_id == program_account)
+            .filter(|effect| effect.program_account_id.value == program)
             .find_map(|effect| {
                 let Effect::Publish { epoch, active } = borsh::from_slice(&effect.data).ok()?
                 else {
@@ -1172,20 +1184,55 @@ mod tests {
         PrivacyPreservingTransaction::new(message, witness_set)
     }
 
-    fn public_call(program_account: AccountId, instruction: Instruction) -> LeeTransaction {
-        let message = lee::public_transaction::Message::try_new(
-            program_account,
-            vec![ProgramShardSelector::new(
-                ORACLE_ACCOUNT_ID,
-                program_account,
-            )],
-            vec![lee_core::account::Nonce::default()],
-            instruction,
+    fn indexed_id(account_id: AccountId) -> indexer_service_protocol::AccountId {
+        indexer_service_protocol::AccountId {
+            value: *account_id.value(),
+        }
+    }
+
+    fn indexed_call(program_account: AccountId, instruction: &Instruction) -> IndexedTransaction {
+        IndexedTransaction::Public(indexer_service_protocol::PublicTransaction {
+            hash: indexer_service_protocol::HashType([0; 32]),
+            message: indexer_service_protocol::PublicMessage {
+                program_account_id: indexed_id(program_account),
+                shard_selectors: Vec::new(),
+                nonces: Vec::new(),
+                instruction_data: borsh::to_vec(instruction).unwrap(),
+                fee: None,
+            },
+            witness_set: indexer_service_protocol::WitnessSet {
+                signatures_and_public_keys: Vec::new(),
+                proof: None,
+            },
+        })
+    }
+
+    fn indexed_effect(program_account: AccountId, effect: &Effect) -> IndexedTransaction {
+        IndexedTransaction::PrivacyPreserving(
+            indexer_service_protocol::PrivacyPreservingTransaction {
+                hash: indexer_service_protocol::HashType([0; 32]),
+                message: indexer_service_protocol::PrivacyPreservingMessage {
+                    public_actions: vec![indexer_service_protocol::PublicActionWithID {
+                        account_id: indexed_id(ORACLE_ACCOUNT_ID),
+                        effects: vec![indexer_service_protocol::DeferredPublicEffect {
+                            program_account_id: indexed_id(program_account),
+                            shard_program_account_id: indexed_id(program_account),
+                            data: borsh::to_vec(effect).unwrap(),
+                        }],
+                    }],
+                    nonces: Vec::new(),
+                    private_actions: Vec::new(),
+                    block_validity_window: indexer_service_protocol::ValidityWindow((None, None)),
+                    timestamp_validity_window: indexer_service_protocol::ValidityWindow((
+                        None, None,
+                    )),
+                },
+                witness_set: indexer_service_protocol::WitnessSet {
+                    signatures_and_public_keys: Vec::new(),
+                    proof: None,
+                },
+            },
         )
-        .unwrap();
-        let key = lee::PrivateKey::new_os_random();
-        let witness_set = lee::public_transaction::WitnessSet::for_message(&message, &[&key]);
-        LeeTransaction::Public(lee::PublicTransaction::new(message, witness_set))
     }
 
     #[test]
@@ -1195,42 +1242,42 @@ mod tests {
         let first = BTreeSet::from([NodeId::new([7; 32])]);
         let corrected = BTreeSet::from([NodeId::new([8; 32])]);
         let history = [
-            public_call(
+            indexed_call(
                 ours,
-                Instruction::Publish {
+                &Instruction::Publish {
                     epoch: 1,
                     active: first.clone(),
                 },
             ),
-            public_call(
+            indexed_call(
                 other,
-                Instruction::Publish {
+                &Instruction::Publish {
                     epoch: 1,
                     active: BTreeSet::new(),
                 },
             ),
-            public_call(
+            indexed_call(
                 ours,
-                Instruction::CashOut {
+                &Instruction::CashOut {
                     node: NodeId::new([7; 32]),
                     points: 1,
                     blinding_factor: [0; 32],
                 },
             ),
-            LeeTransaction::PrivacyPreserving(private_effect(
+            indexed_effect(
                 ours,
                 &Effect::CheckEpoch {
                     epoch: 1,
                     active_digest: active_digest(&first),
                 },
-            )),
-            LeeTransaction::PrivacyPreserving(private_effect(
+            ),
+            indexed_effect(
                 ours,
                 &Effect::Publish {
                     epoch: 1,
                     active: corrected.clone(),
                 },
-            )),
+            ),
         ];
         let store = ReferralStore {
             publications: history
