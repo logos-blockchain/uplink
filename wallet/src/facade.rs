@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use common::{HashType, transaction::LeeTransaction};
 use hkdf::Hkdf;
@@ -24,13 +24,15 @@ use crate::{
     storage::{
         key_chain::FoundPrivateAccount,
         referral::{
-            OperationKind, PendingOperation, PendingRegistration, ReferralIntent, ReferralStore,
-            SubmissionStatus, random_identifier,
+            OperationKind, PendingOperation, PendingRegistration, Publication, ReferralIntent,
+            ReferralStore, SubmissionStatus, random_identifier,
         },
     },
 };
 
 const BLINDING_FACTOR_SALT: &[u8; 31] = b"LEZ/Referral/CashOutFactors/v1\0";
+
+const HISTORY_PAGE_LIMIT: u64 = 10;
 
 pub struct Referral<'wallet> {
     wallet: &'wallet mut WalletCore,
@@ -304,25 +306,204 @@ impl<'wallet> Referral<'wallet> {
             .collect())
     }
 
-    pub async fn claimable(&self, participant: AccountId) -> Result<u128, ExecutionFailureKind> {
-        let states: Vec<State> = self
-            .notes(participant)?
-            .into_iter()
-            .map(|(_id, state)| state)
-            .collect();
-        let registry = self.registry().await?;
-        self.preview(participant, &registry, &states)
+    pub async fn claimable(
+        &mut self,
+        participant: AccountId,
+    ) -> Result<u128, ExecutionFailureKind> {
+        self.batches(participant)
+            .await?
+            .iter()
+            .try_fold(0, |sum: u128, (_operation, total)| sum.checked_add(*total))
+            .ok_or_else(|| conflict("the claimable total overflows"))
     }
 
-    fn preview(
+    pub async fn claim_operations(
+        &mut self,
+        participant: AccountId,
+    ) -> Result<Vec<OperationKind>, ExecutionFailureKind> {
+        Ok(self
+            .batches(participant)
+            .await?
+            .into_iter()
+            .map(|(operation, _total)| operation)
+            .collect())
+    }
+
+    async fn batches(
+        &mut self,
+        participant: AccountId,
+    ) -> Result<Vec<(OperationKind, u128)>, ExecutionFailureKind> {
+        let node = self.participant(participant)?.node;
+        let registry = self.registry().await?;
+        let current = (registry.epoch, active_digest(&registry.active));
+        let mut groups = BTreeMap::from([(current, Vec::new())]);
+        for (id, state) in self.notes(participant)? {
+            let group = if let State::Credit {
+                epoch,
+                active_digest: digest,
+                ..
+            } = state
+            {
+                (epoch, digest)
+            } else {
+                current
+            };
+            groups.entry(group).or_default().push(id);
+        }
+
+        let mut batches = Vec::new();
+        for ((epoch, digest), notes) in groups {
+            let collects = (epoch, digest) != current;
+            let active = self.publication(&registry, epoch, digest).await?;
+            if !active.contains(&node) {
+                continue;
+            }
+            let total = self
+                .claim_for(participant, &notes, epoch, digest, collects, active)?
+                .total;
+            if total == 0 {
+                continue;
+            }
+            let operation = if collects {
+                OperationKind::CollectCredits {
+                    participant,
+                    notes,
+                    epoch,
+                    active_digest: digest,
+                }
+            } else {
+                OperationKind::Claim {
+                    participant,
+                    notes,
+                    epoch,
+                    active_digest: digest,
+                }
+            };
+            batches.push((operation, total));
+        }
+        Ok(batches)
+    }
+
+    async fn publication(
+        &mut self,
+        registry: &Registry,
+        epoch: u32,
+        digest: [u8; 32],
+    ) -> Result<BTreeSet<NodeId>, ExecutionFailureKind> {
+        if (registry.epoch, active_digest(&registry.active)) == (epoch, digest) {
+            return Ok(registry.active.clone());
+        }
+        let program_account = self.program_account();
+        if let Some(active) =
+            self.wallet
+                .storage()
+                .referral()
+                .publication(program_account, epoch, digest)
+        {
+            return Ok(active.clone());
+        }
+        self.refresh_publications().await?;
+        self.wallet
+            .storage()
+            .referral()
+            .publication(program_account, epoch, digest)
+            .cloned()
+            .ok_or_else(|| conflict("the active set of that publication is not available"))
+    }
+
+    async fn refresh_publications(&mut self) -> Result<(), ExecutionFailureKind> {
+        let program_account = self.program_account();
+        let mut offset = self
+            .wallet
+            .storage()
+            .referral()
+            .history_offsets
+            .get(&program_account)
+            .copied()
+            .unwrap_or(0);
+        let mut found = Vec::new();
+        loop {
+            let page = self
+                .wallet
+                .get_transactions_by_account(ORACLE_ACCOUNT_ID, offset, HISTORY_PAGE_LIMIT)
+                .await
+                .map_err(ExecutionFailureKind::SequencerError)?;
+            let fetched = u64::try_from(page.len()).expect("a page length fits in u64");
+            offset = offset
+                .checked_add(fetched)
+                .expect("the history offset fits in u64");
+            found.extend(
+                page.iter()
+                    .filter_map(|transaction| published(transaction, program_account)),
+            );
+            if fetched < HISTORY_PAGE_LIMIT {
+                break;
+            }
+        }
+        self.persisted(|store| {
+            for publication in found {
+                if !store.publications.contains(&publication) {
+                    store.publications.push(publication);
+                }
+            }
+            store.history_offsets.insert(program_account, offset);
+        })
+    }
+
+    fn claim_for(
         &self,
         participant: AccountId,
-        registry: &Registry,
-        states: &[State],
-    ) -> Result<u128, ExecutionFailureKind> {
-        Ok(self
-            .participant(participant)?
-            .claim(registry.epoch, &registry.active, states))
+        notes: &[AccountId],
+        epoch: u32,
+        digest: [u8; 32],
+        collects: bool,
+        active: BTreeSet<NodeId>,
+    ) -> Result<Claim, ExecutionFailureKind> {
+        let mut claimant = self.participant(participant)?;
+        if !active.contains(&claimant.node) {
+            return Err(conflict(
+                "the participant was not active in that publication",
+            ));
+        }
+        let listed = self.notes(participant)?;
+        let states: Vec<State> = notes
+            .iter()
+            .map(|note| {
+                listed
+                    .iter()
+                    .find_map(|(id, state)| (id == note).then(|| state.clone()))
+                    .ok_or_else(|| conflict("this note is not addressed to the participant"))
+            })
+            .collect::<Result<_, _>>()?;
+        for state in &states {
+            let belongs = match *state {
+                State::Credit {
+                    epoch: earned,
+                    active_digest: earned_under,
+                    ..
+                } => (earned, earned_under) == (epoch, digest),
+                State::Child { .. } => !collects,
+                State::Registry(_) | State::Participant(_) | State::CashOut { .. } => false,
+            };
+            if !belongs {
+                return Err(conflict(
+                    "this note does not belong to the claimed publication",
+                ));
+            }
+        }
+        let referrer = claimant.referrer;
+        let total = if collects {
+            claimant.collect_credits(&active, &states)
+        } else {
+            claimant.claim(epoch, &active, &states)
+        };
+        Ok(Claim {
+            epoch,
+            active,
+            notes: states,
+            total,
+            referrer,
+        })
     }
 
     pub async fn publish(
@@ -502,14 +683,14 @@ impl<'wallet> Referral<'wallet> {
     }
 
     async fn build(
-        &self,
+        &mut self,
         reference: [u8; 32],
         operation: OperationKind,
     ) -> Result<PendingOperation, ExecutionFailureKind> {
         let (accounts, instruction) = match &operation {
             OperationKind::Register { participant } => self.register_request(*participant).await?,
-            OperationKind::Claim { participant, notes } => {
-                self.claim_request(*participant, notes).await?
+            OperationKind::Claim { .. } | OperationKind::CollectCredits { .. } => {
+                self.claim_request(&operation).await?
             }
             OperationKind::CashOut { participant, index } => {
                 self.cash_out_request(*participant, *index).await?
@@ -582,51 +763,62 @@ impl<'wallet> Referral<'wallet> {
     }
 
     async fn claim_request(
-        &self,
-        participant: AccountId,
-        notes: &[AccountId],
+        &mut self,
+        operation: &OperationKind,
     ) -> Result<(Vec<AccountMention>, InstructionData), ExecutionFailureKind> {
-        let program_account = self.program_account();
-        let referrer = self.participant(participant)?.referrer;
-        let listed = self.notes(participant)?;
-        let states: Vec<State> = notes
-            .iter()
-            .map(|note| {
-                listed
-                    .iter()
-                    .find_map(|(id, state)| (id == note).then(|| state.clone()))
-                    .ok_or_else(|| conflict("this note is not addressed to the participant"))
-            })
-            .collect::<Result<_, _>>()?;
+        let (OperationKind::Claim {
+            participant,
+            notes,
+            epoch,
+            active_digest: digest,
+        }
+        | OperationKind::CollectCredits {
+            participant,
+            notes,
+            epoch,
+            active_digest: digest,
+        }) = operation
+        else {
+            unreachable!("only claims and credit collections build a claim")
+        };
+        let collects = matches!(operation, OperationKind::CollectCredits { .. });
         let registry = self.registry().await?;
-        let total = self.preview(participant, &registry, &states)?;
-        if total == 0 {
+        if !collects && (registry.epoch, active_digest(&registry.active)) != (*epoch, *digest) {
+            return Err(conflict(
+                "the publication this claim was built for has changed",
+            ));
+        }
+        let active = self.publication(&registry, *epoch, *digest).await?;
+        let claim = self.claim_for(*participant, notes, *epoch, *digest, collects, active)?;
+        if claim.total == 0 {
             return Err(conflict("nothing to claim"));
         }
 
+        let program_account = self.program_account();
         let mut accounts = vec![
-            self.own_private(participant)?
+            self.own_private(*participant)?
                 .select_program_shard(program_account),
-            AccountIdentity::PublicNoSign(ORACLE_ACCOUNT_ID).select_program_shard(program_account),
         ];
+        if !collects {
+            accounts.push(
+                AccountIdentity::PublicNoSign(ORACLE_ACCOUNT_ID)
+                    .select_program_shard(program_account),
+            );
+        }
         for note in notes {
             accounts.push(
                 self.own_private(*note)?
                     .select_program_shard(program_account),
             );
         }
-        self.deliver(participant, referrer, &mut accounts)?;
+        self.deliver(*participant, claim.forward_to(), &mut accounts)?;
 
-        Ok((
-            accounts,
-            instruction_data(Instruction::Claim(Claim {
-                epoch: registry.epoch,
-                active: registry.active,
-                notes: states,
-                total,
-                referrer,
-            })),
-        ))
+        let instruction = if collects {
+            Instruction::CollectCredits(claim)
+        } else {
+            Instruction::Claim(claim)
+        };
+        Ok((accounts, instruction_data(instruction)))
     }
 
     async fn cash_out_request(
@@ -887,6 +1079,42 @@ fn is_superseded(
         }))
 }
 
+fn published(transaction: &LeeTransaction, program_account: AccountId) -> Option<Publication> {
+    let (epoch, active) = match transaction {
+        LeeTransaction::Public(public) => {
+            let message = public.message();
+            if message.program_account_id != program_account {
+                return None;
+            }
+            let Instruction::Publish { epoch, active } =
+                borsh::from_slice(&message.instruction_data).ok()?
+            else {
+                return None;
+            };
+            (epoch, active)
+        }
+        LeeTransaction::PrivacyPreserving(private) => private
+            .message()
+            .public_actions
+            .iter()
+            .filter(|action| action.account_id == ORACLE_ACCOUNT_ID)
+            .flat_map(|action| &action.effects)
+            .filter(|effect| effect.program_account_id == program_account)
+            .find_map(|effect| {
+                let Effect::Publish { epoch, active } = borsh::from_slice(&effect.data).ok()?
+                else {
+                    return None;
+                };
+                Some((epoch, active))
+            })?,
+    };
+    Some(Publication {
+        program_account,
+        epoch,
+        active,
+    })
+}
+
 fn cash_out_transition(
     recorded: SubmissionStatus,
     receipt: &ShardData,
@@ -968,6 +1196,8 @@ mod tests {
             operation: OperationKind::Claim {
                 participant: AccountId::new([3; 32]),
                 notes: vec![],
+                epoch: 1,
+                active_digest: active_digest(&active),
             },
             transaction,
             input_commitments: Vec::new(),

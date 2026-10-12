@@ -1,16 +1,25 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use common::transaction::LeeTransaction;
 use lee::AccountId;
 use lee_core::{Commitment, Identifier};
 use rand::{RngCore as _, rngs::OsRng};
-use referral_core::{Invitation, NodeId, ed25519_dalek::Signature};
+use referral_core::{Invitation, NodeId, active_digest, ed25519_dalek::Signature};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferralStore {
     pub intents: BTreeMap<AccountId, ReferralIntent>,
     pub operations: BTreeMap<String, PendingOperation>,
+    pub publications: Vec<Publication>,
+    pub history_offsets: BTreeMap<AccountId, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Publication {
+    pub program_account: AccountId,
+    pub epoch: u32,
+    pub active: BTreeSet<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +44,14 @@ pub enum OperationKind {
     Claim {
         participant: AccountId,
         notes: Vec<AccountId>,
+        epoch: u32,
+        active_digest: [u8; 32],
+    },
+    CollectCredits {
+        participant: AccountId,
+        notes: Vec<AccountId>,
+        epoch: u32,
+        active_digest: [u8; 32],
     },
     CashOut {
         participant: AccountId,
@@ -73,6 +90,23 @@ impl ReferralStore {
         self.operations
             .insert(operation_key(operation.reference), operation);
     }
+
+    #[must_use]
+    pub fn publication(
+        &self,
+        program_account: AccountId,
+        epoch: u32,
+        digest: [u8; 32],
+    ) -> Option<&BTreeSet<NodeId>> {
+        self.publications
+            .iter()
+            .find(|publication| {
+                publication.program_account == program_account
+                    && publication.epoch == epoch
+                    && active_digest(&publication.active) == digest
+            })
+            .map(|publication| &publication.active)
+    }
 }
 
 impl ReferralIntent {
@@ -99,6 +133,7 @@ impl OperationKind {
         match self {
             Self::Register { participant }
             | Self::Claim { participant, .. }
+            | Self::CollectCredits { participant, .. }
             | Self::CashOut { participant, .. } => *participant,
         }
     }

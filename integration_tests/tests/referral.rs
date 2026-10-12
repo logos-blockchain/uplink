@@ -15,7 +15,8 @@ use key_protocol::key_management::secret_holders::SeedHolder;
 use lee::{AccountId, PrivateKey};
 use program_loader_core::MAX_SEGMENT_DATA_LEN;
 use referral_core::{
-    Invitation, NodeId, ORACLE_ACCOUNT_ID, PROTOTYPE_ORACLE_SIGNING_KEY, State, cash_out_receipt,
+    Invitation, NodeId, ORACLE_ACCOUNT_ID, PROTOTYPE_ORACLE_SIGNING_KEY, State, active_digest,
+    cash_out_receipt,
     ed25519_dalek::{Signer as _, SigningKey},
 };
 use testnet_initial_state::{PublicAccountPrivateInitialData, initial_pub_accounts_private_keys};
@@ -130,15 +131,34 @@ async fn claim(
     participant: AccountId,
     reference: [u8; 32],
 ) -> Result<u128> {
-    let notes = note_ids(ctx, program, participant)?;
-    let (hash, _broadcast) = facade(ctx, program)
-        .submit(reference, OperationKind::Claim { participant, notes })
-        .await?;
-    ctx.wallet().poll_transaction(hash).await?;
-    settle(ctx, program, reference).await?;
-
-    sync_private(ctx).await?;
+    let operations = facade(ctx, program).claim_operations(participant).await?;
+    anyhow::ensure!(
+        !operations.is_empty(),
+        "the participant has nothing to claim"
+    );
+    for (batch, operation) in operations.into_iter().enumerate() {
+        let mut reference = reference;
+        reference[31] = u8::try_from(batch)?;
+        let (hash, _broadcast) = facade(ctx, program).submit(reference, operation).await?;
+        ctx.wallet().poll_transaction(hash).await?;
+        settle(ctx, program, reference).await?;
+        sync_private(ctx).await?;
+    }
     reward_balance(ctx, program, participant)
+}
+
+async fn current_claim(
+    ctx: &mut TestContext,
+    program: AccountId,
+    participant: AccountId,
+) -> Result<OperationKind> {
+    let registry = facade(ctx, program).registry().await?;
+    Ok(OperationKind::Claim {
+        participant,
+        notes: note_ids(ctx, program, participant)?,
+        epoch: registry.epoch,
+        active_digest: active_digest(&registry.active),
+    })
 }
 
 async fn cash_out(
@@ -251,16 +271,8 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
             "{who} has nothing to claim before any epoch is published"
         );
     }
-    let bob_notes = note_ids(&mut ctx, program, bob)?;
-    let bob_refused = facade(&mut ctx, program)
-        .submit(
-            [1; 32],
-            OperationKind::Claim {
-                participant: bob,
-                notes: bob_notes,
-            },
-        )
-        .await;
+    let bob_claim = current_claim(&mut ctx, program, bob).await?;
+    let bob_refused = facade(&mut ctx, program).submit([1; 32], bob_claim).await;
     assert!(
         bob_refused.is_err(),
         "an announced child pays nothing until its node is published as active: {bob_refused:?}"
@@ -323,15 +335,9 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
         0,
         "Bob's own activity is never his own reward"
     );
-    let bob_later_notes = note_ids(&mut ctx, program, bob)?;
+    let bob_later_claim = current_claim(&mut ctx, program, bob).await?;
     let bob_refused_again = facade(&mut ctx, program)
-        .submit(
-            [4; 32],
-            OperationKind::Claim {
-                participant: bob,
-                notes: bob_later_notes,
-            },
-        )
+        .submit([4; 32], bob_later_claim)
         .await;
     assert!(
         bob_refused_again.is_err(),
@@ -387,16 +393,8 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
         0,
         "the epoch that paid Alice's child pays it only once"
     );
-    let alice_notes = note_ids(&mut ctx, program, alice)?;
-    let alice_refused = facade(&mut ctx, program)
-        .submit(
-            [8; 32],
-            OperationKind::Claim {
-                participant: alice,
-                notes: alice_notes,
-            },
-        )
-        .await;
+    let alice_claim = current_claim(&mut ctx, program, alice).await?;
+    let alice_refused = facade(&mut ctx, program).submit([8; 32], alice_claim).await;
     assert!(
         alice_refused.is_err(),
         "a second claim in the same epoch is refused: {alice_refused:?}"
