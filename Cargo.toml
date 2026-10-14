@@ -28,7 +28,7 @@ integration_tests = { git = "https://github.com/logos-blockchain/logos-execution
 
 referral_core = { path = "programs/referral/core" }
 referral_program = { path = "programs/referral" }
-referral_methods = { path = "programs/referral/methods" }
+referral_methods = { path = "programs/referral/methods", features = ["artifacts"] }
 uplink_wallet = { path = "wallet" }
 
 anyhow = "1.0.98"

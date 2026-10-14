@@ -5,7 +5,7 @@ RISC0_DOCKER_CONTAINER_TAG := "r0.1.91.1"
 build-artifacts:
     @echo "Building the referral guest"
     @rm -rf target/programs/referral/methods/riscv32im-risc0-zkvm-elf/docker/*.bin
-    RISC0_DOCKER_CONTAINER_TAG={{RISC0_DOCKER_CONTAINER_TAG}} CARGO_TARGET_DIR=target/programs/referral/methods cargo risczero build --no-default-features --features guest --manifest-path programs/referral/methods/Cargo.toml
+    RISC0_DOCKER_CONTAINER_TAG={{RISC0_DOCKER_CONTAINER_TAG}} CARGO_TARGET_DIR=target/programs/referral/methods cargo risczero build --features guest --manifest-path programs/referral/methods/Cargo.toml
     @mkdir -p artifacts/programs/referral
     @cp target/programs/referral/methods/riscv32im-risc0-zkvm-elf/docker/*.bin artifacts/programs/referral/
 
