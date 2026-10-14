@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use common::transaction::LeeTransaction;
 use integration_tests::{
     TestContext, public_mention,
     utils::{new_account, send, sync_private, wait_for_indexer_to_catch_up},
@@ -18,13 +19,14 @@ use referral_core::{
     cash_out_receipt,
     ed25519_dalek::{Signer as _, SigningKey},
 };
+use referral_methods::referral;
 use testnet_initial_state::{PublicAccountPrivateInitialData, initial_pub_accounts_private_keys};
 use tokio::test;
-use wallet::{
-    cli::execute_keys_restoration,
-    program_facades::{program_loader::ProgramLoader, referral::Referral},
-    storage::referral::{OperationKind, SubmissionStatus},
+use uplink_wallet::{
+    Referral,
+    store::{OperationKind, SubmissionStatus},
 };
+use wallet::{cli::execute_keys_restoration, program_facades::program_loader::ProgramLoader};
 
 const ORACLE_FUNDING: u128 = 100_000_000_000;
 
@@ -42,7 +44,7 @@ fn genesis_payer(ctx: &mut TestContext) -> PublicAccountPrivateInitialData {
 }
 
 async fn deploy_referral(ctx: &mut TestContext, payer: AccountId) -> Result<AccountId> {
-    let program = programs::referral();
+    let program = referral();
     let byte_len = program.user_elf().expect("a test program decodes").len();
     let mut segments = Vec::new();
     for _ in 0..byte_len.div_ceil(MAX_SEGMENT_DATA_LEN) {
@@ -75,7 +77,20 @@ fn import_oracle(ctx: &mut TestContext) -> Result<()> {
 }
 
 fn facade(ctx: &mut TestContext, program: AccountId) -> Referral<'_> {
-    Referral::new(ctx.wallet_mut(), programs::referral(), program)
+    let indexer_addr = format!("http://{}", ctx.indexer_addr())
+        .parse()
+        .expect("the indexer address is a URL");
+    Referral::new(ctx.wallet_mut(), referral(), program)
+        .expect("the referral store opens")
+        .with_indexer(indexer_addr)
+}
+
+/// Forgets the referral store, as losing the device it was kept on would.
+fn forget_referral_store(ctx: &TestContext) -> Result<()> {
+    match std::fs::remove_file(Referral::store_path(ctx.wallet())) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
 }
 
 async fn settle(ctx: &mut TestContext, program: AccountId, reference: [u8; 32]) -> Result<()> {
@@ -169,17 +184,14 @@ async fn cash_out(
     let (hash, _broadcast) = facade(ctx, program)
         .cash_out(reference, participant)
         .await?;
-    ctx.wallet().poll_transaction(hash).await?;
+    let (included, _block) = ctx.wallet().poll_transaction(hash).await?;
     settle(ctx, program, reference).await?;
     sync_private(ctx).await?;
 
-    let recorded = ctx
-        .wallet()
-        .storage()
-        .referral()
-        .operation(reference)
-        .ok_or_else(|| anyhow::anyhow!("a submitted cash out is recorded"))?;
-    let [receipt] = recorded.transaction.message().public_actions.as_slice() else {
+    let LeeTransaction::PrivacyPreserving(transaction) = included else {
+        anyhow::bail!("a cash out is a privacy-preserving transaction");
+    };
+    let [receipt] = transaction.message().public_actions.as_slice() else {
         anyhow::bail!("a cash out mentions exactly one public account");
     };
     Ok(receipt.account_id)
@@ -227,9 +239,6 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
     let payer = genesis_payer(&mut ctx);
     let program = deploy_referral(&mut ctx, payer.account_id).await?;
     fund_oracle(&mut ctx, payer.account_id).await?;
-    let mut config = ctx.wallet().config().clone();
-    config.indexer_addr = Some(format!("http://{}", ctx.indexer_addr()).parse()?);
-    ctx.wallet_mut().set_config(config);
 
     let (carol_key, carol_node) = node(3);
     let (alice_key, alice_node) = node(2);
@@ -568,6 +577,7 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
     );
 
     ctx.wallet_mut().restore_storage(&mnemonic, &password)?;
+    forget_referral_store(&ctx)?;
     execute_keys_restoration(ctx.wallet_mut(), RESTORE_DEPTH).await?;
 
     assert_eq!(
