@@ -1,14 +1,20 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::PathBuf,
+};
 
-use common::HashType;
+use anyhow::Context as _;
+use common::{HashType, transaction::LeeTransaction};
 use hkdf::Hkdf;
 use indexer_service_protocol::Transaction as IndexedTransaction;
+use indexer_service_rpc::RpcClient as _;
+use jsonrpsee::http_client::HttpClientBuilder;
 use lee::{
-    Account, AccountId, PrivacyPreservingTransaction,
-    privacy_preserving_transaction::circuit::ProgramWithDependencies, program::Program,
+    Account, AccountId, privacy_preserving_transaction::circuit::ProgramWithDependencies,
+    program::Program,
 };
 use lee_core::{
-    NullifierSecretKey, PrivateAccountKind,
+    BlockId, Commitment, NullifierSecretKey, PrivateAccountKind,
     account::{ProgramShardSelector, ShardData},
     program::InstructionData,
 };
@@ -18,26 +24,43 @@ use referral_core::{
     ed25519_dalek::Signature,
 };
 use sha2::Sha256;
+use url::Url;
+use wallet::{
+    AccountIdentity, AccountMention, ExecutionFailureKind, WalletCore,
+    storage::key_chain::FoundPrivateAccount,
+};
 
-use crate::{
-    AccountIdentity, ExecutionFailureKind, WalletCore,
-    account_manager::AccountMention,
-    storage::{
-        key_chain::FoundPrivateAccount,
-        referral::{
-            OperationKind, PendingOperation, PendingRegistration, Publication, ReferralIntent,
-            ReferralStore, SubmissionStatus, random_identifier,
-        },
-    },
+use crate::store::{
+    OperationKind, PendingOperation, PendingRegistration, Publication, ReferralIntent,
+    ReferralStore, RegistryGuard, SubmissionStatus, random_identifier,
 };
 
 const BLINDING_FACTOR_SALT: &[u8; 31] = b"LEZ/Referral/CashOutFactors/v1\0";
 
 const HISTORY_PAGE_LIMIT: u64 = 10;
 
+/// Blocks after which a sent attempt that is neither included nor outspent counts as lost, and a
+/// later submit builds it again. Both attempts spend the same inputs, so at most one is included.
+const RESUBMIT_AFTER_BLOCKS: BlockId = 20;
+
+/// File name of the referral store, kept next to the wallet's own storage.
+const STORE_FILE_NAME: &str = "referral.json";
+
 pub struct Referral<'wallet> {
     wallet: &'wallet mut WalletCore,
     program: ProgramWithDependencies,
+    store: ReferralStore,
+    store_path: PathBuf,
+    indexer_addr: Option<Url>,
+}
+
+/// One attempt's account mentions and instruction, with what is recorded alongside it.
+struct Request {
+    accounts: Vec<AccountMention>,
+    instruction: InstructionData,
+    /// The wallet's own private accounts the attempt spends.
+    inputs: Vec<AccountId>,
+    registry_guard: Option<RegistryGuard>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -85,17 +108,38 @@ impl ReceiptKeys {
 }
 
 impl<'wallet> Referral<'wallet> {
-    #[must_use]
+    /// Opens the referral deployment at `program_account` over `wallet`, with the referral store
+    /// that sits next to the wallet's storage.
     pub fn new(
         wallet: &'wallet mut WalletCore,
         program: Program,
         program_account: AccountId,
-    ) -> Self {
+    ) -> Result<Self, ExecutionFailureKind> {
+        let store_path = Self::store_path(wallet);
+        let store =
+            ReferralStore::load(&store_path).map_err(ExecutionFailureKind::SequencerError)?;
         let dependencies = HashMap::from([(program_account, program.clone())]);
-        Self {
+        Ok(Self {
             wallet,
             program: ProgramWithDependencies::new(program, program_account, dependencies),
-        }
+            store,
+            store_path,
+            indexer_addr: None,
+        })
+    }
+
+    /// Where the referral store of `wallet` is kept.
+    #[must_use]
+    pub fn store_path(wallet: &WalletCore) -> PathBuf {
+        wallet.storage_path().with_file_name(STORE_FILE_NAME)
+    }
+
+    /// Reads past publications from the indexer at `indexer_addr`, which collecting delayed
+    /// credits needs.
+    #[must_use]
+    pub fn with_indexer(mut self, indexer_addr: Url) -> Self {
+        self.indexer_addr = Some(indexer_addr);
+        self
     }
 
     #[must_use]
@@ -129,7 +173,7 @@ impl<'wallet> Referral<'wallet> {
 
     #[must_use]
     pub fn intent(&self, participant: AccountId) -> Option<&ReferralIntent> {
-        self.wallet.storage().referral().intents.get(&participant)
+        self.store.intents.get(&participant)
     }
 
     #[must_use]
@@ -139,9 +183,7 @@ impl<'wallet> Referral<'wallet> {
 
     #[must_use]
     pub fn operation_status(&self, reference: [u8; 32]) -> Option<SubmissionStatus> {
-        self.wallet
-            .storage()
-            .referral()
+        self.store
             .operation(reference)
             .map(|operation| operation.status)
     }
@@ -401,18 +443,11 @@ impl<'wallet> Referral<'wallet> {
             return Ok(registry.active.clone());
         }
         let program_account = self.program_account();
-        if let Some(active) =
-            self.wallet
-                .storage()
-                .referral()
-                .publication(program_account, epoch, digest)
-        {
+        if let Some(active) = self.store.publication(program_account, epoch, digest) {
             return Ok(active.clone());
         }
         self.refresh_publications().await?;
-        self.wallet
-            .storage()
-            .referral()
+        self.store
             .publication(program_account, epoch, digest)
             .cloned()
             .ok_or_else(|| conflict("the active set of that publication is not available"))
@@ -421,19 +456,28 @@ impl<'wallet> Referral<'wallet> {
     async fn refresh_publications(&mut self) -> Result<(), ExecutionFailureKind> {
         let program_account = self.program_account();
         let mut offset = self
-            .wallet
-            .storage()
-            .referral()
+            .store
             .history_offsets
             .get(&program_account)
             .copied()
             .unwrap_or(0);
+        let indexer_addr = self
+            .indexer_addr
+            .as_ref()
+            .ok_or_else(|| conflict("past publications need an indexer endpoint"))?;
+        let indexer = HttpClientBuilder::default()
+            .build(indexer_addr)
+            .context("Failed to create the indexer client")
+            .map_err(ExecutionFailureKind::SequencerError)?;
+        let oracle = indexer_service_protocol::AccountId {
+            value: *ORACLE_ACCOUNT_ID.value(),
+        };
         let mut found = Vec::new();
         loop {
-            let page = self
-                .wallet
-                .get_transactions_by_account(ORACLE_ACCOUNT_ID, offset, HISTORY_PAGE_LIMIT)
+            let page = indexer
+                .get_transactions_by_account(oracle, offset, HISTORY_PAGE_LIMIT)
                 .await
+                .context("Failed to read the oracle's history from the indexer")
                 .map_err(ExecutionFailureKind::SequencerError)?;
             let fetched = u64::try_from(page.len()).expect("a page length fits in u64");
             offset = offset
@@ -499,9 +543,7 @@ impl<'wallet> Referral<'wallet> {
         participant: AccountId,
     ) -> Result<(HashType, SubmissionStatus), ExecutionFailureKind> {
         let recorded = self
-            .wallet
-            .storage()
-            .referral()
+            .store
             .operation(reference)
             .map(|recorded| recorded.operation.clone());
         let index = match recorded {
@@ -524,37 +566,24 @@ impl<'wallet> Referral<'wallet> {
         operation: OperationKind,
     ) -> Result<(HashType, SubmissionStatus), ExecutionFailureKind> {
         let program_account = self.program_account();
-        let recorded = self
-            .wallet
-            .storage()
-            .referral()
-            .operation(reference)
-            .cloned();
+        let recorded = self.store.operation(reference).cloned();
         if let Some(recorded) = recorded {
             if recorded.program_account != program_account || recorded.operation != operation {
                 return Err(conflict(
                     "this reference was already used for a different deployment or operation",
                 ));
             }
-            let hash = HashType(recorded.transaction.hash());
+            // A pending attempt is left to land. One that is lost, outspent or superseded
+            // reconciles as rejected and is built again from the current state.
             let status = self.reconcile(reference).await?;
-            match status {
-                SubmissionStatus::Settled => {
-                    return Ok((hash, status));
-                }
-                SubmissionStatus::Pending => {
-                    self.rebroadcast(recorded.transaction).await?;
-                    return Ok((hash, SubmissionStatus::Pending));
-                }
-                SubmissionStatus::Rejected => {}
+            if status != SubmissionStatus::Rejected {
+                return Ok((recorded.hash, status));
             }
         }
 
         let participant = operation.participant();
         let unresolved: Vec<[u8; 32]> = self
-            .wallet
-            .storage()
-            .referral()
+            .store
             .operations
             .values()
             .filter(|other| {
@@ -572,10 +601,9 @@ impl<'wallet> Referral<'wallet> {
             }
         }
 
-        let built = self.build(reference, operation).await?;
-        let transaction = built.transaction.clone();
-        self.persisted(|store| store.record_operation(built))?;
-        let hash = self.rebroadcast(transaction).await?;
+        let sent = self.send(reference, operation).await?;
+        let hash = sent.hash;
+        self.persisted(|store| store.record_operation(sent))?;
         Ok((hash, SubmissionStatus::Pending))
     }
 
@@ -583,13 +611,7 @@ impl<'wallet> Referral<'wallet> {
         &mut self,
         reference: [u8; 32],
     ) -> Result<SubmissionStatus, ExecutionFailureKind> {
-        let Some(recorded) = self
-            .wallet
-            .storage()
-            .referral()
-            .operation(reference)
-            .cloned()
-        else {
+        let Some(recorded) = self.store.operation(reference).cloned() else {
             return Ok(SubmissionStatus::Rejected);
         };
         if recorded.status != SubmissionStatus::Settled
@@ -619,13 +641,8 @@ impl<'wallet> Referral<'wallet> {
             ))
             .await
             .map_err(ExecutionFailureKind::SequencerError)?;
-        let settled = self
-            .wallet
-            .commitments_settled(&recorded.transaction.message().commitments())
-            .await
-            .map_err(ExecutionFailureKind::SequencerError)?;
 
-        if settled {
+        if self.is_included(&recorded).await? {
             return self.set_status(reference, SubmissionStatus::Settled);
         }
 
@@ -633,15 +650,60 @@ impl<'wallet> Referral<'wallet> {
             return self.set_status(reference, SubmissionStatus::Rejected);
         }
 
+        if self.is_lost(&recorded).await? {
+            return self.set_status(reference, SubmissionStatus::Rejected);
+        }
+
         Ok(SubmissionStatus::Pending)
     }
 
-    async fn build(
+    /// Whether the attempt's transaction is in a block and its new commitments are in the
+    /// commitment set.
+    async fn is_included(&self, recorded: &PendingOperation) -> Result<bool, ExecutionFailureKind> {
+        let included = self
+            .wallet
+            .get_transaction(recorded.hash)
+            .await
+            .map_err(ExecutionFailureKind::SequencerError)?;
+        let Some((LeeTransaction::PrivacyPreserving(transaction), _block)) = included else {
+            return Ok(false);
+        };
+        self.commitments_settled(&transaction.message().commitments())
+            .await
+    }
+
+    async fn commitments_settled(
+        &self,
+        commitments: &[Commitment],
+    ) -> Result<bool, ExecutionFailureKind> {
+        if commitments.is_empty() {
+            return Ok(false);
+        }
+        let (proofs, _root) = self
+            .wallet
+            .get_proofs_and_root(commitments)
+            .await
+            .map_err(ExecutionFailureKind::SequencerError)?;
+        Ok(proofs.len() == commitments.len() && proofs.iter().all(Option::is_some))
+    }
+
+    /// Whether the attempt has waited [`RESUBMIT_AFTER_BLOCKS`] without being included.
+    async fn is_lost(&self, recorded: &PendingOperation) -> Result<bool, ExecutionFailureKind> {
+        let last_block = self
+            .wallet
+            .get_last_block_id()
+            .await
+            .map_err(ExecutionFailureKind::SequencerError)?;
+        Ok(last_block.saturating_sub(recorded.sent_at_block) >= RESUBMIT_AFTER_BLOCKS)
+    }
+
+    /// Builds, proves and sends one attempt at `operation`, returning what to record for it.
+    async fn send(
         &mut self,
         reference: [u8; 32],
         operation: OperationKind,
     ) -> Result<PendingOperation, ExecutionFailureKind> {
-        let (accounts, instruction) = match &operation {
+        let request = match &operation {
             OperationKind::Register { participant } => self.register_request(*participant).await?,
             OperationKind::Claim { .. } | OperationKind::CollectCredits { .. } => {
                 self.claim_request(&operation).await?
@@ -651,32 +713,36 @@ impl<'wallet> Referral<'wallet> {
             }
         };
 
-        self.private_operation(reference, operation, accounts, instruction)
-            .await
-    }
-
-    async fn private_operation(
-        &self,
-        reference: [u8; 32],
-        operation: OperationKind,
-        accounts: Vec<AccountMention>,
-        instruction: InstructionData,
-    ) -> Result<PendingOperation, ExecutionFailureKind> {
-        let built = self
+        // Taken before sending: these are the states the attempt spends, which a later commitment
+        // that differs from them shows to be outspent.
+        let input_commitments = request
+            .inputs
+            .iter()
+            .map(|account_id| {
+                self.wallet
+                    .get_private_account_commitment(*account_id)
+                    .map(|commitment| (*account_id, commitment))
+                    .ok_or(ExecutionFailureKind::KeyNotFoundError)
+            })
+            .collect::<Result<_, _>>()?;
+        let sent_at_block = self
             .wallet
-            .build_privacy_preserving_tx_with_pre_check(
-                accounts,
-                instruction,
-                &self.program,
-                |_| Ok(()),
-            )
+            .get_last_block_id()
+            .await
+            .map_err(ExecutionFailureKind::SequencerError)?;
+        let (hash, _shared_secrets) = self
+            .wallet
+            .send_privacy_preserving_tx(request.accounts, request.instruction, &self.program)
             .await?;
+
         Ok(PendingOperation {
             reference,
             program_account: self.program_account(),
             operation,
-            transaction: built.transaction,
-            input_commitments: built.input_commitments,
+            hash,
+            sent_at_block,
+            registry_guard: request.registry_guard,
+            input_commitments,
             status: SubmissionStatus::Pending,
         })
     }
@@ -684,7 +750,7 @@ impl<'wallet> Referral<'wallet> {
     async fn register_request(
         &self,
         participant: AccountId,
-    ) -> Result<(Vec<AccountMention>, InstructionData), ExecutionFailureKind> {
+    ) -> Result<Request, ExecutionFailureKind> {
         let program_account = self.program_account();
         let (node, referrer, node_signature) = self
             .pending_registration(participant)
@@ -705,21 +771,23 @@ impl<'wallet> Referral<'wallet> {
         ];
         self.deliver(participant, referrer, &mut accounts)?;
 
-        Ok((
+        Ok(Request {
             accounts,
-            instruction_data(Instruction::Register {
+            instruction: instruction_data(Instruction::Register {
                 node,
                 referrer,
                 node_signature,
                 pool: registry.nodes,
             }),
-        ))
+            inputs: vec![participant],
+            registry_guard: Some(RegistryGuard::Registers { node }),
+        })
     }
 
     async fn claim_request(
         &mut self,
         operation: &OperationKind,
-    ) -> Result<(Vec<AccountMention>, InstructionData), ExecutionFailureKind> {
+    ) -> Result<Request, ExecutionFailureKind> {
         let (OperationKind::Claim {
             participant,
             notes,
@@ -784,19 +852,32 @@ impl<'wallet> Referral<'wallet> {
         }
         self.deliver(*participant, claim.forward_to(), &mut accounts)?;
 
-        let instruction = if collects {
-            Instruction::CollectCredits(claim)
+        let (instruction, registry_guard) = if collects {
+            (Instruction::CollectCredits(claim), None)
         } else {
-            Instruction::Claim(claim)
+            (
+                Instruction::Claim(claim),
+                Some(RegistryGuard::ChecksEpoch {
+                    epoch: *epoch,
+                    active_digest: *digest,
+                }),
+            )
         };
-        Ok((accounts, instruction_data(instruction)))
+        Ok(Request {
+            accounts,
+            instruction: instruction_data(instruction),
+            inputs: std::iter::once(*participant)
+                .chain(notes.iter().copied())
+                .collect(),
+            registry_guard,
+        })
     }
 
     async fn cash_out_request(
         &self,
         participant: AccountId,
         index: u64,
-    ) -> Result<(Vec<AccountMention>, InstructionData), ExecutionFailureKind> {
+    ) -> Result<Request, ExecutionFailureKind> {
         let program_account = self.program_account();
         let points = self.participant(participant)?.reward_balance;
         if points == 0 {
@@ -810,19 +891,21 @@ impl<'wallet> Referral<'wallet> {
         }
         let opening = keys.opening(index);
 
-        Ok((
-            vec![
+        Ok(Request {
+            accounts: vec![
                 self.own_private(participant)?
                     .select_program_shard(program_account),
                 AccountIdentity::PublicNoSign(opening.account_id)
                     .select_program_shard(program_account),
             ],
-            instruction_data(Instruction::CashOut {
+            instruction: instruction_data(Instruction::CashOut {
                 node: opening.node,
                 points,
                 blinding_factor: opening.blinding_factor,
             }),
-        ))
+            inputs: vec![participant],
+            registry_guard: None,
+        })
     }
 
     async fn scan(&self, keys: &ReceiptKeys) -> Result<(Vec<Receipt>, u64), ExecutionFailureKind> {
@@ -904,15 +987,6 @@ impl<'wallet> Referral<'wallet> {
             })
     }
 
-    async fn rebroadcast(
-        &self,
-        transaction: PrivacyPreservingTransaction,
-    ) -> Result<HashType, ExecutionFailureKind> {
-        self.wallet
-            .submit_privacy_preserving_transaction(transaction)
-            .await
-    }
-
     fn set_status(
         &mut self,
         reference: [u8; 32],
@@ -951,11 +1025,11 @@ impl<'wallet> Referral<'wallet> {
         &mut self,
         mutate: impl FnOnce(&mut ReferralStore) -> T,
     ) -> Result<T, ExecutionFailureKind> {
-        let snapshot = self.wallet.storage().referral().clone();
-        let value = mutate(self.wallet.storage_mut().referral_mut());
-        if let Err(error) = self.persist() {
-            *self.wallet.storage_mut().referral_mut() = snapshot;
-            return Err(error);
+        let snapshot = self.store.clone();
+        let value = mutate(&mut self.store);
+        if let Err(error) = self.store.save(&self.store_path) {
+            self.store = snapshot;
+            return Err(ExecutionFailureKind::SequencerError(error));
         }
         Ok(value)
     }
@@ -1061,31 +1135,14 @@ fn is_superseded(
     registry: &Account,
 ) -> Result<bool, ExecutionFailureKind> {
     let registry = decode_registry(registry, recorded.program_account)?;
-    Ok(recorded
-        .transaction
-        .message()
-        .public_actions
-        .iter()
-        .filter(|action| action.account_id == ORACLE_ACCOUNT_ID)
-        .flat_map(|action| &action.effects)
-        .filter(|effect| effect.program_account_id == recorded.program_account)
-        .any(|effect| {
-            match borsh::from_slice::<Effect>(&effect.data)
-                .expect("referral effect data decodes as referral_core::Effect")
-            {
-                Effect::Register { node, .. } => registry.nodes.contains(&node),
-                Effect::CheckEpoch {
-                    epoch,
-                    active_digest: digest,
-                } => registry.epoch != epoch || active_digest(&registry.active) != digest,
-                Effect::Publish { .. }
-                | Effect::Create(_)
-                | Effect::Claim(_)
-                | Effect::CollectCredits(_)
-                | Effect::Consume(_)
-                | Effect::CashOutBurn { .. } => false,
-            }
-        }))
+    Ok(match recorded.registry_guard {
+        Some(RegistryGuard::Registers { node }) => registry.nodes.contains(&node),
+        Some(RegistryGuard::ChecksEpoch {
+            epoch,
+            active_digest: digest,
+        }) => registry.epoch != epoch || active_digest(&registry.active) != digest,
+        None => false,
+    })
 }
 
 fn published(transaction: &IndexedTransaction, program_account: AccountId) -> Option<Publication> {
@@ -1159,30 +1216,7 @@ fn instruction_data(instruction: Instruction) -> InstructionData {
 
 #[cfg(test)]
 mod tests {
-    use lee::privacy_preserving_transaction::{
-        circuit::Proof,
-        message::{Message, PublicActionWithID},
-        witness_set::WitnessSet,
-    };
-    use lee_core::execution_state::DeferredPublicEffect;
-
     use super::*;
-
-    fn private_effect(program_account: AccountId, effect: &Effect) -> PrivacyPreservingTransaction {
-        let message = Message {
-            public_actions: vec![PublicActionWithID {
-                account_id: ORACLE_ACCOUNT_ID,
-                effects: vec![DeferredPublicEffect {
-                    program_account_id: program_account,
-                    shard_program_account_id: program_account,
-                    data: borsh::to_vec(effect).unwrap(),
-                }],
-            }],
-            ..Message::default()
-        };
-        let witness_set = WitnessSet::for_message(&message, Proof::from_inner(Vec::new()), &[]);
-        PrivacyPreservingTransaction::new(message, witness_set)
-    }
 
     fn indexed_id(account_id: AccountId) -> indexer_service_protocol::AccountId {
         indexer_service_protocol::AccountId {
@@ -1308,13 +1342,6 @@ mod tests {
         let ours = AccountId::new([1; 32]);
         let other = AccountId::new([2; 32]);
         let active = BTreeSet::from([NodeId::new([9; 32])]);
-        let transaction = private_effect(
-            ours,
-            &Effect::CheckEpoch {
-                epoch: 1,
-                active_digest: active_digest(&active),
-            },
-        );
 
         let recorded = PendingOperation {
             reference: [0; 32],
@@ -1325,7 +1352,12 @@ mod tests {
                 epoch: 1,
                 active_digest: active_digest(&active),
             },
-            transaction,
+            hash: HashType([0; 32]),
+            sent_at_block: 0,
+            registry_guard: Some(RegistryGuard::ChecksEpoch {
+                epoch: 1,
+                active_digest: active_digest(&active),
+            }),
             input_commitments: Vec::new(),
             status: SubmissionStatus::Pending,
         };
