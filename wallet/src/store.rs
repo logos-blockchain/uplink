@@ -62,6 +62,8 @@ pub enum OperationKind {
     CashOut {
         participant: AccountId,
         index: u64,
+        /// The receipt this cash-out creates, so it reconciles without the receipt secret.
+        receipt: AccountId,
     },
 }
 
@@ -254,6 +256,7 @@ mod tests {
             operation: OperationKind::CashOut {
                 participant,
                 index: 3,
+                receipt: AccountId::new([4; 32]),
             },
             registry_guard: None,
             ..register_operation([8; 32], program_account, participant)

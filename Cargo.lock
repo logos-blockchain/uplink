@@ -12157,7 +12157,6 @@ dependencies = [
  "borsh",
  "common",
  "hex",
- "hkdf 0.12.4",
  "indexer_service_protocol",
  "indexer_service_rpc",
  "jsonrpsee",

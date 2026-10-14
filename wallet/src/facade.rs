@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::Context as _;
 use common::{HashType, transaction::LeeTransaction};
-use hkdf::Hkdf;
 use indexer_service_protocol::Transaction as IndexedTransaction;
 use indexer_service_rpc::RpcClient as _;
 use jsonrpsee::http_client::HttpClientBuilder;
@@ -14,16 +13,15 @@ use lee::{
     program::Program,
 };
 use lee_core::{
-    BlockId, Commitment, NullifierSecretKey, PrivateAccountKind,
+    BlockId, Commitment, PrivateAccountKind,
     account::{ProgramShardSelector, ShardData},
     program::InstructionData,
 };
 use referral_core::{
     Claim, Effect, Epoch, Instruction, Invitation, NodeId, ORACLE_ACCOUNT_ID, Participant,
-    ParticipantAuthorizationV1, Points, Referrer, Registry, State, active_digest, cash_out_receipt,
-    ed25519_dalek::Signature,
+    ParticipantAuthorizationV1, Points, Referrer, Registry, State, active_digest, blinding_factor,
+    cash_out_receipt, ed25519_dalek::Signature,
 };
-use sha2::Sha256;
 use url::Url;
 use wallet::{
     AccountIdentity, AccountMention, ExecutionFailureKind, WalletCore,
@@ -34,8 +32,6 @@ use crate::store::{
     OperationKind, PendingOperation, PendingRegistration, Publication, ReferralIntent,
     ReferralStore, RegistryGuard, SubmissionStatus, random_identifier,
 };
-
-const BLINDING_FACTOR_SALT: &[u8; 31] = b"LEZ/Referral/CashOutFactors/v1\0";
 
 const HISTORY_PAGE_LIMIT: u64 = 10;
 
@@ -82,22 +78,17 @@ struct ReceiptKeys {
     program_account: AccountId,
     participant: AccountId,
     node: NodeId,
-    nsk: NullifierSecretKey,
+    receipt_secret: [u8; 32],
 }
 
 impl ReceiptKeys {
     fn opening(&self, index: u64) -> Opening {
-        let mut blinding_factor = [0; 32];
-        Hkdf::<Sha256>::new(Some(BLINDING_FACTOR_SALT), &self.nsk)
-            .expand_multi_info(
-                &[
-                    self.program_account.as_ref(),
-                    self.participant.as_ref(),
-                    &index.to_le_bytes(),
-                ],
-                &mut blinding_factor,
-            )
-            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        let blinding_factor = blinding_factor(
+            &self.receipt_secret,
+            self.program_account,
+            self.participant,
+            index,
+        );
         Opening {
             program_account: self.program_account,
             node: self.node,
@@ -525,29 +516,37 @@ impl<'wallet> Referral<'wallet> {
             .await
     }
 
+    /// The opening of the participant's `index`-th receipt, under its node's `receipt_secret`.
     pub fn opening(
         &self,
         participant: AccountId,
         index: u64,
+        receipt_secret: &[u8; 32],
     ) -> Result<Opening, ExecutionFailureKind> {
         Ok(self
-            .receipt_keys(self.program_account(), participant)?
+            .receipt_keys(participant, receipt_secret)?
             .opening(index))
     }
 
+    /// The participant's receipts, found from its node's `receipt_secret` and the chain alone.
     pub async fn receipts(
         &self,
         participant: AccountId,
+        receipt_secret: &[u8; 32],
     ) -> Result<Vec<Receipt>, ExecutionFailureKind> {
-        let keys = self.receipt_keys(self.program_account(), participant)?;
+        let keys = self.receipt_keys(participant, receipt_secret)?;
         Ok(self.scan(&keys).await?.0)
     }
 
+    /// Cashes the whole reward balance out into the participant's next receipt, under its node's
+    /// `receipt_secret`. The secret is used for this call only and never stored.
     pub async fn cash_out(
         &mut self,
         reference: [u8; 32],
         participant: AccountId,
+        receipt_secret: &[u8; 32],
     ) -> Result<(HashType, SubmissionStatus), ExecutionFailureKind> {
+        let keys = self.receipt_keys(participant, receipt_secret)?;
         let recorded = self
             .store
             .operation(reference)
@@ -556,20 +555,35 @@ impl<'wallet> Referral<'wallet> {
             Some(OperationKind::CashOut {
                 participant: holder,
                 index,
+                ..
             }) if holder == participant => index,
-            _ => {
-                let keys = self.receipt_keys(self.program_account(), participant)?;
-                self.scan(&keys).await?.1
-            }
+            _ => self.scan(&keys).await?.1,
         };
-        self.submit(reference, OperationKind::CashOut { participant, index })
+        let operation = OperationKind::CashOut {
+            participant,
+            index,
+            receipt: keys.opening(index).account_id,
+        };
+        self.submit_with(reference, operation, Some(receipt_secret))
             .await
     }
 
+    /// Submits `operation` under `reference`, or resumes the attempt already recorded under it.
+    ///
+    /// A cash-out needs its receipt secret and goes through [`Self::cash_out`] instead.
     pub async fn submit(
         &mut self,
         reference: [u8; 32],
         operation: OperationKind,
+    ) -> Result<(HashType, SubmissionStatus), ExecutionFailureKind> {
+        self.submit_with(reference, operation, None).await
+    }
+
+    async fn submit_with(
+        &mut self,
+        reference: [u8; 32],
+        operation: OperationKind,
+        receipt_secret: Option<&[u8; 32]>,
     ) -> Result<(HashType, SubmissionStatus), ExecutionFailureKind> {
         let program_account = self.program_account();
         let recorded = self.store.operation(reference).cloned();
@@ -607,7 +621,7 @@ impl<'wallet> Referral<'wallet> {
             }
         }
 
-        let sent = self.send(reference, operation).await?;
+        let sent = self.send(reference, operation, receipt_secret).await?;
         let hash = sent.hash;
         self.persisted(|store| store.record_operation(sent))?;
         Ok((hash, SubmissionStatus::Pending))
@@ -621,12 +635,8 @@ impl<'wallet> Referral<'wallet> {
             return Ok(SubmissionStatus::Rejected);
         };
         if recorded.status != SubmissionStatus::Settled
-            && let OperationKind::CashOut { participant, index } = recorded.operation
+            && let OperationKind::CashOut { receipt, .. } = recorded.operation
         {
-            let receipt = self
-                .receipt_keys(recorded.program_account, participant)?
-                .opening(index)
-                .account_id;
             let shard = self
                 .receipt_shard(recorded.program_account, receipt)
                 .await?;
@@ -708,14 +718,22 @@ impl<'wallet> Referral<'wallet> {
         &mut self,
         reference: [u8; 32],
         operation: OperationKind,
+        receipt_secret: Option<&[u8; 32]>,
     ) -> Result<PendingOperation, ExecutionFailureKind> {
         let request = match &operation {
             OperationKind::Register { participant } => self.register_request(*participant).await?,
             OperationKind::Claim { .. } | OperationKind::CollectCredits { .. } => {
                 self.claim_request(&operation).await?
             }
-            OperationKind::CashOut { participant, index } => {
-                self.cash_out_request(*participant, *index).await?
+            OperationKind::CashOut {
+                participant,
+                index,
+                receipt,
+            } => {
+                let receipt_secret = receipt_secret
+                    .ok_or_else(|| conflict("a cash out needs its receipt secret; use cash_out"))?;
+                self.cash_out_request(*participant, *index, *receipt, receipt_secret)
+                    .await?
             }
         };
 
@@ -902,19 +920,26 @@ impl<'wallet> Referral<'wallet> {
         &self,
         participant: AccountId,
         index: u64,
+        receipt: AccountId,
+        receipt_secret: &[u8; 32],
     ) -> Result<Request, ExecutionFailureKind> {
         let program_account = self.program_account();
         let points = self.participant(participant)?.reward_balance;
         if points == 0 {
             return Err(conflict("nothing to cash out"));
         }
-        let keys = self.receipt_keys(program_account, participant)?;
+        let keys = self.receipt_keys(participant, receipt_secret)?;
         if self.scan(&keys).await?.1 != index {
             return Err(conflict(
                 "a cash out takes the participant's first free receipt index",
             ));
         }
         let opening = keys.opening(index);
+        if opening.account_id != receipt {
+            return Err(conflict(
+                "this receipt secret opens another receipt than the one recorded",
+            ));
+        }
 
         Ok(Request {
             accounts: vec![
@@ -955,15 +980,14 @@ impl<'wallet> Referral<'wallet> {
 
     fn receipt_keys(
         &self,
-        program_account: AccountId,
         participant: AccountId,
+        receipt_secret: &[u8; 32],
     ) -> Result<ReceiptKeys, ExecutionFailureKind> {
-        let found = self.found(participant)?;
         Ok(ReceiptKeys {
-            program_account,
+            program_account: self.program_account(),
             participant,
-            node: decode_participant(found.account, program_account)?.node,
-            nsk: found.key_chain.private_key_holder.nullifier_secret_key(),
+            node: self.participant(participant)?.node,
+            receipt_secret: *receipt_secret,
         })
     }
 
@@ -1461,52 +1485,40 @@ mod tests {
         );
     }
 
-    fn keys(nsk: u8, program_account: u8, participant: u8) -> ReceiptKeys {
+    fn keys(secret: u8, program_account: u8, participant: u8) -> ReceiptKeys {
         ReceiptKeys {
             program_account: AccountId::new([program_account; 32]),
             participant: AccountId::new([participant; 32]),
             node: NodeId::new([7; 32]),
-            nsk: [nsk; 32],
+            receipt_secret: [secret; 32],
         }
     }
 
     #[test]
-    fn blinding_factors_expand_the_nullifier_key_per_deployment_participant_and_index() {
+    fn an_opening_is_the_core_blinding_factor_and_its_receipt() {
+        let opening = keys(1, 2, 3).opening(4);
+        let factor = blinding_factor(
+            &[1; 32],
+            AccountId::new([2; 32]),
+            AccountId::new([3; 32]),
+            4,
+        );
+
+        assert_eq!(opening.blinding_factor, factor);
+        assert_eq!(opening.node, NodeId::new([7; 32]));
         assert_eq!(
-            keys(1, 2, 3).opening(0).blinding_factor,
-            [
-                0x54, 0x10, 0xab, 0x83, 0x00, 0xd8, 0x55, 0x91, 0x80, 0x35, 0x91, 0xd3, 0x63, 0x92,
-                0x8f, 0x68, 0xbf, 0xe5, 0x33, 0x91, 0x4a, 0x2a, 0x92, 0x85, 0x45, 0xe3, 0xa5, 0xc4,
-                0x84, 0xae, 0x3d, 0x91,
-            ]
+            opening.account_id,
+            cash_out_receipt(AccountId::new([2; 32]), NodeId::new([7; 32]), factor)
         );
-        assert_eq!(
-            keys(1, 2, 3).opening(1).blinding_factor,
-            [
-                0x43, 0xf5, 0xae, 0x83, 0xb9, 0x5a, 0x50, 0x56, 0x90, 0x52, 0x64, 0x0d, 0xaf, 0x83,
-                0x2f, 0xd8, 0xf0, 0xff, 0x23, 0xea, 0x55, 0x5c, 0x94, 0xdf, 0xc4, 0xd6, 0xfa, 0xda,
-                0x06, 0x16, 0xb6, 0xe5,
-            ]
-        );
-        assert_eq!(
-            keys(1, 2, 6).opening(0).blinding_factor,
-            [
-                0x2b, 0x25, 0x4b, 0xc3, 0x61, 0x68, 0x41, 0x91, 0x7f, 0xcf, 0xf0, 0x0b, 0x9b, 0x6b,
-                0x40, 0xce, 0x8c, 0x17, 0x68, 0xe5, 0x8b, 0xba, 0xce, 0x7c, 0xcf, 0xa6, 0xd3, 0x9c,
-                0x7f, 0x9c, 0x17, 0xc9,
-            ]
-        );
-        assert_eq!(
-            keys(1, 5, 3).opening(0).blinding_factor,
-            [
-                0x28, 0x10, 0x70, 0x87, 0x4b, 0x39, 0x57, 0x21, 0x9d, 0x83, 0x8d, 0xc3, 0x06, 0xba,
-                0xd8, 0x7f, 0x07, 0x43, 0xab, 0x2f, 0xf0, 0x5d, 0xc8, 0xd3, 0x69, 0x35, 0x34, 0xad,
-                0x67, 0xe3, 0xcf, 0xec,
-            ]
-        );
-        assert_ne!(
-            keys(4, 2, 3).opening(0).blinding_factor,
-            keys(1, 2, 3).opening(0).blinding_factor
-        );
+    }
+
+    #[test]
+    fn openings_differ_per_secret_deployment_participant_and_index() {
+        let opening = keys(1, 2, 3).opening(0).account_id;
+
+        assert_ne!(keys(1, 2, 3).opening(1).account_id, opening);
+        assert_ne!(keys(4, 2, 3).opening(0).account_id, opening);
+        assert_ne!(keys(1, 5, 3).opening(0).account_id, opening);
+        assert_ne!(keys(1, 2, 6).opening(0).account_id, opening);
     }
 }

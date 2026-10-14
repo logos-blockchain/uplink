@@ -23,7 +23,7 @@ use referral_methods::referral;
 use testnet_initial_state::{PublicAccountPrivateInitialData, initial_pub_accounts_private_keys};
 use tokio::test;
 use uplink_wallet::{
-    Referral,
+    Referral, receipt_secret,
     store::{OperationKind, SubmissionStatus},
 };
 use wallet::{cli::execute_keys_restoration, program_facades::program_loader::ProgramLoader};
@@ -179,10 +179,11 @@ async fn cash_out(
     ctx: &mut TestContext,
     program: AccountId,
     participant: AccountId,
+    receipt_secret: &[u8; 32],
     reference: [u8; 32],
 ) -> Result<AccountId> {
     let (hash, _broadcast) = facade(ctx, program)
-        .cash_out(reference, participant)
+        .cash_out(reference, participant, receipt_secret)
         .await?;
     let (included, _block) = ctx.wallet().poll_transaction(hash).await?;
     settle(ctx, program, reference).await?;
@@ -562,6 +563,8 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
     )
     .await?;
 
+    // Carol's operator derives the receipt secret from her node key and hands it to her wallet.
+    let carol_secret = receipt_secret(&carol_key.to_bytes());
     let mut sent = Vec::new();
     for (epoch, claimed, cashed_out) in [(1, [1; 32], [2; 32]), (2, [3; 32], [4; 32])] {
         publish(&mut ctx, program, epoch, &[alice_node, carol_node]).await?;
@@ -570,7 +573,7 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
             1,
             "Carol's active child pays one per epoch"
         );
-        sent.push(cash_out(&mut ctx, program, carol, cashed_out).await?);
+        sent.push(cash_out(&mut ctx, program, carol, &carol_secret, cashed_out).await?);
         assert_eq!(
             reward_balance(&mut ctx, program, carol)?,
             0,
@@ -578,7 +581,9 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
         );
     }
 
-    let receipts = facade(&mut ctx, program).receipts(carol).await?;
+    let receipts = facade(&mut ctx, program)
+        .receipts(carol, &carol_secret)
+        .await?;
     assert_eq!(
         receipts
             .iter()
@@ -597,13 +602,24 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
         None,
         "restoring from the mnemonic forgets every recorded operation"
     );
+    // Nor did the receipt secret survive: the operator derives it again from the node key.
+    let rederived_secret = receipt_secret(&carol_key.to_bytes());
     assert_eq!(
-        facade(&mut ctx, program).receipts(carol).await?,
+        facade(&mut ctx, program)
+            .receipts(carol, &rederived_secret)
+            .await?,
         receipts,
-        "the mnemonic and the chain recover every receipt"
+        "the node key, the mnemonic and the chain recover every receipt"
+    );
+    assert!(
+        facade(&mut ctx, program)
+            .receipts(carol, &receipt_secret(&alice_key.to_bytes()))
+            .await?
+            .is_empty(),
+        "another node's receipt secret opens none of Carol's receipts"
     );
     for (index, sent_to) in (0..).zip(&sent) {
-        let opening = facade(&mut ctx, program).opening(carol, index)?;
+        let opening = facade(&mut ctx, program).opening(carol, index, &rederived_secret)?;
         assert_eq!(
             cash_out_receipt(opening.program_account, carol_node, opening.blinding_factor),
             *sent_to,
@@ -627,10 +643,10 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
         2,
         "the restored Carol keeps earning, with the credit Alice addressed from her own state"
     );
-    let third = cash_out(&mut ctx, program, carol, [6; 32]).await?;
+    let third = cash_out(&mut ctx, program, carol, &rederived_secret, [6; 32]).await?;
     assert_eq!(
         facade(&mut ctx, program)
-            .receipts(carol)
+            .receipts(carol, &rederived_secret)
             .await?
             .iter()
             .map(|receipt| (receipt.index, receipt.account_id))

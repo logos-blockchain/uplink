@@ -35,7 +35,6 @@ anyhow = "1.0.98"
 borsh = "1.5.7"
 ed25519-dalek = { version = "2.2.0", default-features = false }
 hex = "0.4.3"
-hkdf = "0.12.4"
 jsonrpsee = "0.26.0"
 rand = { version = "0.8.5", features = ["std", "std_rng", "getrandom"] }
 risc0-zkvm = { version = "3.0.5", default-features = false, features = ['std'] }

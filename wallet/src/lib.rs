@@ -4,6 +4,8 @@
 //! keeps what it needs to resume them in its own store next to the wallet's storage.
 
 pub use facade::{Opening, Receipt, Referral};
+pub use receipt::receipt_secret;
 
 pub mod facade;
+pub mod receipt;
 pub mod store;

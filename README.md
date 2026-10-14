@@ -44,4 +44,32 @@ Tests always run with `RISC0_DEV_MODE=1`, so they execute the guest without prov
 
 `uplink_wallet` uses the user's LEZ wallet for keys, accounts and sync, and keeps its own state in
 `referral.json` next to the wallet's storage: pending registrations, invitations, submitted operations
-and the past publications it has read from the indexer.
+and the past publications it has read from the indexer. It never stores a receipt secret.
+
+## Cash-out receipts
+
+A cash-out burns the participant's whole balance into a public receipt account that only the node's
+operator can link to the node. The link is a blinding factor derived from a receipt secret, which the
+operator derives once from the node's Ed25519 secret key (its 32-byte seed) and hands to the
+participant's wallet:
+
+```text
+receipt_secret     = SHA256("LEZ/Referral/ReceiptSecret/v1\0"  || node_secret)
+blinding_factor(i) = SHA256("LEZ/Referral/BlindingFactor/v1\0" || receipt_secret
+                            || program_account || participant || i as 8 little-endian bytes)
+receipt(i)         = public PDA of program_account with seed
+                     SHA256("LEZ/Referral/CashOut/v1\0" || node || blinding_factor(i))
+```
+
+The tags end in a zero byte, and every account and node is its 32 raw bytes. The program sees only
+the blinding factor; neither secret leaves the operator and the wallet. To be paid, a holder reveals a
+receipt's opening: the node and its blinding factor. After losing a device, the operator derives the
+receipt secret again from the node key, and the wallet finds every receipt from it and the chain.
+
+```sh
+uplink derive-receipt-secret --node-key-file node.key --out receipt.secret
+uplink --program <ID> cash-out --participant <ID> --receipt-secret-file receipt.secret
+```
+
+`referral_core::blinding_factor` and `uplink_wallet::receipt_secret` pin both derivations with test
+vectors.

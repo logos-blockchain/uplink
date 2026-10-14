@@ -21,6 +21,8 @@ const AUTHORIZATION_DOMAIN: &[u8; 37] = b"LEZ/Referral/AuthorizeParticipant/v1\0
 
 const CASH_OUT_DOMAIN: &[u8; 24] = b"LEZ/Referral/CashOut/v1\0";
 
+const BLINDING_FACTOR_DOMAIN: &[u8; 31] = b"LEZ/Referral/BlindingFactor/v1\0";
+
 /// An epoch, numbered by the oracle's publications.
 pub type Epoch = u32;
 
@@ -358,6 +360,29 @@ pub fn active_digest(active: &BTreeSet<NodeId>) -> [u8; 32] {
     sha256(&borsh::to_vec(active).expect("borsh serialization is infallible"))
 }
 
+/// The blinding factor of a participant's `index`-th cash-out receipt.
+///
+/// Derived off-chain from the node's receipt secret, so only the node's operator can find the
+/// receipts and open them, and can find them again from the node key alone. The program never
+/// sees the secret: a cash-out carries only the factor. Computed as
+/// `SHA256("LEZ/Referral/BlindingFactor/v1\0" || receipt_secret || program_account ||
+/// participant || index as 8 little-endian bytes)`.
+#[must_use]
+pub fn blinding_factor(
+    receipt_secret: &[u8; 32],
+    program_account: AccountId,
+    participant: AccountId,
+    index: u64,
+) -> [u8; 32] {
+    let mut preimage = [0; 31 + 32 + 32 + 32 + 8];
+    preimage[..31].copy_from_slice(BLINDING_FACTOR_DOMAIN);
+    preimage[31..63].copy_from_slice(receipt_secret);
+    preimage[63..95].copy_from_slice(program_account.as_ref());
+    preimage[95..127].copy_from_slice(participant.as_ref());
+    preimage[127..].copy_from_slice(&index.to_le_bytes());
+    sha256(&preimage)
+}
+
 #[must_use]
 pub fn cash_out_receipt(
     program_account: AccountId,
@@ -537,6 +562,39 @@ mod tests {
             receipt
         );
         assert_ne!(cash_out_receipt(PROGRAM, NODE, [6; 32]), receipt);
+    }
+
+    #[test]
+    fn the_blinding_factor_is_the_prefixed_hash_of_the_secret_deployment_participant_and_index() {
+        let secret = [1; 32];
+        let (program, participant) = (AccountId::new([2; 32]), AccountId::new([3; 32]));
+
+        assert_eq!(
+            blinding_factor(&secret, program, participant, 0),
+            [
+                0x26, 0x61, 0x03, 0x8b, 0x4e, 0xd1, 0x40, 0xac, 0x06, 0x5f, 0x09, 0xda, 0x28, 0x0c,
+                0x2e, 0x43, 0xd5, 0x0e, 0xd6, 0x97, 0x9c, 0x0c, 0x93, 0x62, 0x10, 0xd7, 0x14, 0x96,
+                0x92, 0x78, 0x1d, 0x2c,
+            ]
+        );
+        assert_eq!(
+            blinding_factor(&secret, program, participant, 1),
+            [
+                0xe5, 0xbf, 0x2b, 0xcf, 0x5d, 0x51, 0xfc, 0x9e, 0xf4, 0x37, 0x50, 0xda, 0xea, 0x75,
+                0xf4, 0x1f, 0x90, 0x6d, 0x3b, 0xd9, 0x39, 0x32, 0xd4, 0x3c, 0x48, 0x96, 0xbe, 0xc3,
+                0xbb, 0x3c, 0x7c, 0x89,
+            ]
+        );
+        let factor = blinding_factor(&secret, program, participant, 0);
+        assert_ne!(blinding_factor(&[4; 32], program, participant, 0), factor);
+        assert_ne!(
+            blinding_factor(&secret, AccountId::new([5; 32]), participant, 0),
+            factor
+        );
+        assert_ne!(
+            blinding_factor(&secret, program, AccountId::new([6; 32]), 0),
+            factor
+        );
     }
 
     #[test]

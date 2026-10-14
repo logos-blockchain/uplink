@@ -8,7 +8,11 @@
 //! The wallet is loaded the way the LEZ `wallet` binary loads it, and must already be set up. The
 //! referral store is kept next to the wallet's storage.
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
@@ -23,9 +27,10 @@ use wallet::WalletCore;
 #[derive(Parser)]
 #[command(about = "Node referral program on the Logos Execution Zone")]
 struct Args {
-    /// Account the referral program is deployed at.
+    /// Account the referral program is deployed at. Needed by every command but
+    /// `derive-receipt-secret`.
     #[arg(long, env = "UPLINK_PROGRAM")]
-    program: AccountId,
+    program: Option<AccountId>,
     /// Indexer endpoint, needed to collect credits earned in past epochs.
     #[arg(long, env = "UPLINK_INDEXER")]
     indexer: Option<Url>,
@@ -35,6 +40,16 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Derive a node's receipt secret from its Ed25519 secret key, for its participant's wallet.
+    /// Run by the node's operator; needs neither a wallet nor a deployment.
+    DeriveReceiptSecret {
+        /// File holding the node's 32-byte Ed25519 secret key, as hex.
+        #[arg(long)]
+        node_key_file: PathBuf,
+        /// File to write the receipt secret to, readable by its owner only.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Create a private participant account.
     NewParticipant,
     /// Show a participant's referral state.
@@ -95,6 +110,8 @@ enum Command {
     CashOut {
         #[arg(long)]
         participant: AccountId,
+        #[command(flatten)]
+        receipt_secret: ReceiptSecretFile,
         /// Resume an earlier attempt under its reference.
         #[arg(long, value_parser = parse_reference)]
         reference: Option<[u8; 32]>,
@@ -103,6 +120,8 @@ enum Command {
     Receipts {
         #[arg(long)]
         participant: AccountId,
+        #[command(flatten)]
+        receipt_secret: ReceiptSecretFile,
     },
     /// Print the opening that links a receipt to the participant's node.
     Opening {
@@ -110,6 +129,8 @@ enum Command {
         participant: AccountId,
         #[arg(long)]
         index: u64,
+        #[command(flatten)]
+        receipt_secret: ReceiptSecretFile,
     },
     /// Reconcile and print the status of a submitted operation.
     Status {
@@ -126,6 +147,20 @@ enum Command {
     },
 }
 
+/// The node's receipt secret, written by `derive-receipt-secret`.
+#[derive(clap::Args)]
+struct ReceiptSecretFile {
+    /// File holding the node's receipt secret, as hex.
+    #[arg(long = "receipt-secret-file", env = "UPLINK_RECEIPT_SECRET_FILE")]
+    path: PathBuf,
+}
+
+impl ReceiptSecretFile {
+    fn read(&self) -> Result<[u8; 32]> {
+        read_hex_file(&self.path)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let Args {
@@ -133,6 +168,12 @@ async fn main() -> Result<()> {
         indexer,
         command,
     } = Args::parse();
+
+    if let Command::DeriveReceiptSecret { node_key_file, out } = &command {
+        let secret = uplink_wallet::receipt_secret(&read_hex_file(node_key_file)?);
+        return write_secret_file(out, &hex::encode(secret));
+    }
+    let program = program.context("--program or UPLINK_PROGRAM is required")?;
 
     let mut wallet =
         WalletCore::from_env().context("Failed to load the LEZ wallet; set it up with `wallet`")?;
@@ -150,6 +191,7 @@ async fn main() -> Result<()> {
 
 async fn run(facade: &mut Referral<'_>, command: Command) -> Result<()> {
     match command {
+        Command::DeriveReceiptSecret { .. } => unreachable!("handled before the wallet is loaded"),
         Command::NewParticipant => println!("{}", facade.create_participant()?),
         Command::Show { participant } => show(facade, participant)?,
         Command::Invite {
@@ -202,22 +244,35 @@ async fn run(facade: &mut Referral<'_>, command: Command) -> Result<()> {
         }
         Command::CashOut {
             participant,
+            receipt_secret,
             reference,
         } => {
             let reference = reference.unwrap_or_else(new_reference);
-            let (hash, status) = facade.cash_out(reference, participant).await?;
+            let (hash, status) = facade
+                .cash_out(reference, participant, &receipt_secret.read()?)
+                .await?;
             print_submission(reference, &hash.to_string(), status);
         }
-        Command::Receipts { participant } => {
-            for receipt in facade.receipts(participant).await? {
+        Command::Receipts {
+            participant,
+            receipt_secret,
+        } => {
+            for receipt in facade
+                .receipts(participant, &receipt_secret.read()?)
+                .await?
+            {
                 println!(
                     "{}\t{}\t{} points",
                     receipt.index, receipt.account_id, receipt.points
                 );
             }
         }
-        Command::Opening { participant, index } => {
-            let opening = facade.opening(participant, index)?;
+        Command::Opening {
+            participant,
+            index,
+            receipt_secret,
+        } => {
+            let opening = facade.opening(participant, index, &receipt_secret.read()?)?;
             println!("program\t{}", opening.program_account);
             println!("node\t{}", hex::encode(opening.node.to_bytes()));
             println!("blinding_factor\t{}", hex::encode(opening.blinding_factor));
@@ -287,6 +342,26 @@ fn print_submission(
         "reference {}\ttransaction {hash}\t{status:?}",
         hex::encode(reference)
     );
+}
+
+fn read_hex_file(path: &Path) -> Result<[u8; 32]> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    parse_array(text.trim())
+        .with_context(|| format!("{} does not hold 32 hex bytes", path.display()))
+}
+
+/// Writes `contents` to `path`, readable and writable by its owner only.
+fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("Failed to create {}", path.display()))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 fn new_reference() -> [u8; 32] {

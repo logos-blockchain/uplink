@@ -19,7 +19,6 @@ wallet.workspace = true
 anyhow.workspace = true
 borsh.workspace = true
 hex.workspace = true
-hkdf.workspace = true
 jsonrpsee = { workspace = true, features = ["http-client"] }
 rand.workspace = true
 serde.workspace = true
