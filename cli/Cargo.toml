@@ -1,0 +1,27 @@
+[package]
+name = "uplink"
+version = "0.1.0"
+edition = "2024"
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "uplink"
+path = "src/main.rs"
+
+[dependencies]
+lee.workspace = true
+referral_core.workspace = true
+referral_methods.workspace = true
+uplink_wallet.workspace = true
+wallet.workspace = true
+
+anyhow.workspace = true
+clap = { version = "4.5.42", features = ["derive", "env"] }
+hex.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url = { version = "2.5.4", features = ["serde"] }
