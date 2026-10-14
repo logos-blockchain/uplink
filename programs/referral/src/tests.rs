@@ -3,12 +3,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use lee_core::{
+    NullifierPublicKey,
     account::{AccountId, ShardData},
+    encryption::ViewingPublicKey,
     program::{AccountMeta, Plan, PlanInput, ShardEffect},
 };
 use referral_core::{
     Claim, Effect, Instruction, NodeId, ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1,
-    Registry, State, active_digest, cash_out_receipt,
+    Referrer, Registry, State, active_digest, cash_out_receipt,
     ed25519_dalek::{Signer as _, SigningKey},
 };
 
@@ -18,6 +20,16 @@ fn node(seed: u8) -> (SigningKey, NodeId) {
     let key = SigningKey::from_bytes(&[seed; 32]);
     let id = NodeId::new(key.verifying_key().to_bytes());
     (key, id)
+}
+
+/// `node` as a referrer, with keys derived from its id.
+fn referrer(node: NodeId) -> Referrer {
+    let bytes = node.to_bytes();
+    Referrer {
+        node,
+        npk: NullifierPublicKey(bytes),
+        vpk: ViewingPublicKey::from_seed(&bytes, &bytes),
+    }
 }
 
 fn account(seed: u8) -> AccountId {
@@ -134,7 +146,7 @@ fn a_referred_register_announces_the_child_to_its_referrer() {
         ],
         Instruction::Register {
             node: node_id,
-            referrer: Some(parent),
+            referrer: Some(referrer(parent)),
             node_signature: signature(&node_key, node_id, participant_account, Some(parent)),
             pool: pool.clone(),
         },
@@ -145,7 +157,10 @@ fn a_referred_register_announces_the_child_to_its_referrer() {
         vec![
             ShardEffect::new(
                 &meta(participant_account, true),
-                &Effect::Create(State::Participant(Participant::new(node_id, Some(parent)))),
+                &Effect::Create(State::Participant(Participant::new(
+                    node_id,
+                    Some(referrer(parent))
+                ))),
             ),
             ShardEffect::new(
                 &meta(ORACLE_ACCOUNT_ID, false),
@@ -180,7 +195,7 @@ fn a_referred_register_requires_a_child_note_account() {
         ],
         Instruction::Register {
             node: node(1).1,
-            referrer: Some(parent),
+            referrer: Some(referrer(parent)),
             node_signature: [0; 64],
             pool: BTreeSet::new(),
         },
@@ -222,7 +237,7 @@ fn register_requires_the_referrer_in_its_pool() {
         ],
         Instruction::Register {
             node: node_id,
-            referrer: Some(parent),
+            referrer: Some(referrer(parent)),
             node_signature: signature(&node_key, node_id, participant_account, Some(parent)),
             pool: BTreeSet::from([other]),
         },
@@ -364,14 +379,14 @@ fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
 
     let written = crate::apply(
         Effect::Claim(claim),
-        &State::Participant(Participant::new(me, Some(parent))).to_data(),
+        &State::Participant(Participant::new(me, Some(referrer(parent)))).to_data(),
     )
     .expect("Claim writes the participant");
     assert_eq!(
         State::decode(&written),
         Some(State::Participant(Participant {
             node: me,
-            referrer: Some(parent),
+            referrer: Some(referrer(parent)),
             children: BTreeMap::from([(c, 2)]),
             reward_balance: 5,
         }))
@@ -470,14 +485,14 @@ fn a_claim_forwards_nothing_to_an_inactive_referrer() {
     );
     let written = crate::apply(
         Effect::Claim(claim),
-        &State::Participant(Participant::new(me, Some(parent))).to_data(),
+        &State::Participant(Participant::new(me, Some(referrer(parent)))).to_data(),
     )
     .expect("Claim writes the participant");
     assert_eq!(
         State::decode(&written),
         Some(State::Participant(Participant {
             node: me,
-            referrer: Some(parent),
+            referrer: Some(referrer(parent)),
             children: BTreeMap::from([(c, 2)]),
             reward_balance: 1,
         }))
@@ -565,7 +580,7 @@ fn a_credit_collection_forwards_under_its_earning_publication() {
         Effect::CollectCredits(claim),
         &State::Participant(Participant {
             node: me,
-            referrer: Some(parent),
+            referrer: Some(referrer(parent)),
             children: BTreeMap::from([(c, 1)]),
             reward_balance: 5,
         })
@@ -576,7 +591,7 @@ fn a_credit_collection_forwards_under_its_earning_publication() {
         State::decode(&written),
         Some(State::Participant(Participant {
             node: me,
-            referrer: Some(parent),
+            referrer: Some(referrer(parent)),
             children: BTreeMap::from([(c, 1)]),
             reward_balance: 12,
         }))
@@ -736,7 +751,7 @@ fn a_cash_out_burns_the_full_balance_into_its_receipt() {
 
     let earned = Participant {
         node: me,
-        referrer: Some(parent),
+        referrer: Some(referrer(parent)),
         children: BTreeMap::from([(c, 2)]),
         reward_balance: 7,
     };

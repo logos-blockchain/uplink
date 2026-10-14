@@ -20,7 +20,7 @@ use lee_core::{
 };
 use referral_core::{
     Claim, Effect, Epoch, Instruction, Invitation, NodeId, ORACLE_ACCOUNT_ID, Participant,
-    ParticipantAuthorizationV1, Points, Registry, State, active_digest, cash_out_receipt,
+    ParticipantAuthorizationV1, Points, Referrer, Registry, State, active_digest, cash_out_receipt,
     ed25519_dalek::Signature,
 };
 use sha2::Sha256;
@@ -212,7 +212,11 @@ impl<'wallet> Referral<'wallet> {
             .cloned()
             .unwrap_or_else(|| ReferralIntent::new(self.program_account()));
         let recorded = intent.registration.as_ref().map_or_else(
-            || self.participant(participant).ok().map(|me| me.referrer),
+            || {
+                self.participant(participant)
+                    .ok()
+                    .map(|me| me.referrer_node())
+            },
             |pending| Some(pending.referrer),
         );
         if recorded.is_some_and(|referrer| referrer != Some(parent)) {
@@ -766,12 +770,26 @@ impl<'wallet> Referral<'wallet> {
             return Err(conflict("the referrer is not registered"));
         }
 
+        // The participant's state keeps the referrer's keys, so later claims address the
+        // referrer without the invitation.
+        let referrer = referrer
+            .map(|parent| {
+                self.intent(participant)
+                    .and_then(|intent| intent.invitation.clone())
+                    .filter(|invitation| invitation.parent_node == parent)
+                    .map(Referrer::from)
+                    .ok_or_else(|| {
+                        conflict("the referrer's invitation is needed to address its note")
+                    })
+            })
+            .transpose()?;
+
         let mut accounts = vec![
             self.own_private(participant)?
                 .select_program_shard(program_account),
             AccountIdentity::PublicNoSign(ORACLE_ACCOUNT_ID).select_program_shard(program_account),
         ];
-        self.deliver(participant, referrer, &mut accounts)?;
+        self.deliver(referrer.as_ref(), &mut accounts);
 
         Ok(Request {
             accounts,
@@ -852,7 +870,12 @@ impl<'wallet> Referral<'wallet> {
                     .select_program_shard(program_account),
             );
         }
-        self.deliver(*participant, claim.forward_to(), &mut accounts)?;
+        let forward_to = claim.forward_to();
+        let referrer = self
+            .participant(*participant)?
+            .referrer
+            .filter(|referrer| Some(referrer.node) == forward_to);
+        self.deliver(referrer.as_ref(), &mut accounts);
 
         let (instruction, registry_guard) = if collects {
             (Instruction::CollectCredits(claim), None)
@@ -957,25 +980,11 @@ impl<'wallet> Referral<'wallet> {
         Ok(account.data.shard(program_account).clone())
     }
 
-    fn deliver(
-        &self,
-        participant: AccountId,
-        referrer: Option<NodeId>,
-        accounts: &mut Vec<AccountMention>,
-    ) -> Result<(), ExecutionFailureKind> {
-        let program_account = self.program_account();
-        let Some(parent) = referrer else {
-            return Ok(());
-        };
-
-        let invitation = self
-            .intent(participant)
-            .and_then(|intent| intent.invitation.clone())
-            .filter(|invitation| invitation.parent_node == parent)
-            .ok_or_else(|| conflict("the referrer's invitation is needed to address its note"))?;
-        accounts.push(foreign_note(&invitation).select_program_shard(program_account));
-
-        Ok(())
+    /// Mentions a new note account addressed to `referrer`, if there is one to notify.
+    fn deliver(&self, referrer: Option<&Referrer>, accounts: &mut Vec<AccountMention>) {
+        if let Some(referrer) = referrer {
+            accounts.push(foreign_note(referrer).select_program_shard(self.program_account()));
+        }
     }
 
     fn is_outspent(&self, recorded: &PendingOperation) -> bool {
@@ -1117,7 +1126,7 @@ fn claim_for(
             ));
         }
     }
-    let referrer = claimant.referrer;
+    let referrer = claimant.referrer_node();
     let total = if collects {
         claimant.collect_credits(&active, &states)
     } else {
@@ -1204,10 +1213,10 @@ fn conflict(message: &str) -> ExecutionFailureKind {
     ))
 }
 
-fn foreign_note(invitation: &Invitation) -> AccountIdentity {
+fn foreign_note(referrer: &Referrer) -> AccountIdentity {
     AccountIdentity::PrivateForeign {
-        npk: invitation.npk,
-        vpk: invitation.vpk.clone(),
+        npk: referrer.npk,
+        vpk: referrer.vpk.clone(),
         kind: PrivateAccountKind::Regular(random_identifier()),
     }
 }

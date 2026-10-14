@@ -536,8 +536,10 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
 
     let (carol_key, carol_node) = node(3);
     let (alice_key, alice_node) = node(2);
+    let (bob_key, bob_node) = node(1);
     let carol = facade(&mut ctx, program).create_participant()?;
     let alice = facade(&mut ctx, program).create_participant()?;
+    let bob = facade(&mut ctx, program).create_participant()?;
     register(&mut ctx, program, carol, &carol_key, None, None).await?;
     let carol_invites_alice = facade(&mut ctx, program).invitation(carol, carol_node)?;
     register(
@@ -547,6 +549,16 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
         &alice_key,
         Some(carol_node),
         Some(carol_invites_alice),
+    )
+    .await?;
+    let alice_invites_bob = facade(&mut ctx, program).invitation(alice, alice_node)?;
+    register(
+        &mut ctx,
+        program,
+        bob,
+        &bob_key,
+        Some(alice_node),
+        Some(alice_invites_bob),
     )
     .await?;
 
@@ -599,12 +611,21 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
         );
     }
 
+    assert!(
+        facade(&mut ctx, program).intent(alice).is_none(),
+        "the restored wallet no longer holds the invitation Alice registered with"
+    );
     import_oracle(&mut ctx)?;
-    publish(&mut ctx, program, 3, &[alice_node, carol_node]).await?;
+    publish(&mut ctx, program, 3, &[bob_node, alice_node, carol_node]).await?;
+    assert_eq!(
+        claim(&mut ctx, program, alice, [7; 32]).await?,
+        1,
+        "the restored Alice is paid for her active child"
+    );
     assert_eq!(
         claim(&mut ctx, program, carol, [5; 32]).await?,
-        1,
-        "the restored participant keeps earning"
+        2,
+        "the restored Carol keeps earning, with the credit Alice addressed from her own state"
     );
     let third = cash_out(&mut ctx, program, carol, [6; 32]).await?;
     assert_eq!(

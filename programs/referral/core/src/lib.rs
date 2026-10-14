@@ -78,6 +78,28 @@ impl Invitation {
     }
 }
 
+/// A participant's referrer: its node, and the keys the participant addresses its notes to.
+///
+/// Kept in the participant's state so that a wallet restored from its mnemonic can still address
+/// the referrer, without the invitation it registered with. The keys are as the invitation gave
+/// them; the program does not authenticate them.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Referrer {
+    pub node: NodeId,
+    pub npk: NullifierPublicKey,
+    pub vpk: ViewingPublicKey,
+}
+
+impl From<Invitation> for Referrer {
+    fn from(invitation: Invitation) -> Self {
+        Self {
+            node: invitation.parent_node,
+            npk: invitation.npk,
+            vpk: invitation.vpk,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Registry {
     pub nodes: BTreeSet<NodeId>,
@@ -88,20 +110,26 @@ pub struct Registry {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Participant {
     pub node: NodeId,
-    pub referrer: Option<NodeId>,
+    pub referrer: Option<Referrer>,
     pub children: BTreeMap<NodeId, Epoch>,
     pub reward_balance: Points,
 }
 
 impl Participant {
     #[must_use]
-    pub const fn new(node: NodeId, referrer: Option<NodeId>) -> Self {
+    pub const fn new(node: NodeId, referrer: Option<Referrer>) -> Self {
         Self {
             node,
             referrer,
             children: BTreeMap::new(),
             reward_balance: 0,
         }
+    }
+
+    /// The referrer's node, if this participant has a referrer.
+    #[must_use]
+    pub fn referrer_node(&self) -> Option<NodeId> {
+        self.referrer.as_ref().map(|referrer| referrer.node)
     }
 
     #[must_use]
@@ -275,7 +303,7 @@ impl Claim {
 pub enum Instruction {
     Register {
         node: NodeId,
-        referrer: Option<NodeId>,
+        referrer: Option<Referrer>,
         node_signature: [u8; 64],
         pool: BTreeSet<NodeId>,
     },

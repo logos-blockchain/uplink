@@ -44,7 +44,8 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             );
             assert_authorized(participant);
             assert_registry(registry);
-            if let Some(parent) = referrer {
+            let parent = referrer.as_ref().map(|referrer| referrer.node);
+            if let Some(parent) = parent {
                 assert!(pool.contains(&parent), "the pool must contain the referrer");
             }
             assert!(
@@ -52,7 +53,7 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                     input.self_account_id,
                     node,
                     participant.account_id,
-                    referrer,
+                    parent,
                 )
                 .verify(&node_signature),
                 "node authorization signature is invalid"
@@ -63,7 +64,7 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                 &Effect::Create(State::Participant(Participant::new(node, referrer))),
             );
             plan.effect(registry, &Effect::Register { node, pool });
-            if let Some((parent, child)) = referrer.zip(child) {
+            if let Some((parent, child)) = parent.zip(child) {
                 plan.effect(
                     child,
                     &Effect::Create(State::Child {
@@ -252,7 +253,8 @@ fn settle(
 ) -> ShardData {
     let mut participant = decode_participant(pre_data);
     assert_eq!(
-        participant.referrer, claim.referrer,
+        participant.referrer_node(),
+        claim.referrer,
         "the claim names another referrer"
     );
     assert_eq!(

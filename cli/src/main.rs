@@ -243,7 +243,7 @@ fn show(facade: &Referral<'_>, participant: AccountId) -> Result<()> {
             println!(
                 "referrer\t{}",
                 state
-                    .referrer
+                    .referrer_node()
                     .map_or_else(|| "none".to_owned(), |node| hex::encode(node.to_bytes()))
             );
             println!("children\t{}", state.children.len());
