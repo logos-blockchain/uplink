@@ -19,8 +19,8 @@ use lee_core::{
     program::InstructionData,
 };
 use referral_core::{
-    Claim, Effect, Instruction, Invitation, NodeId, ORACLE_ACCOUNT_ID, Participant,
-    ParticipantAuthorizationV1, Registry, State, active_digest, cash_out_receipt,
+    Claim, Effect, Epoch, Instruction, Invitation, NodeId, ORACLE_ACCOUNT_ID, Participant,
+    ParticipantAuthorizationV1, Points, Registry, State, active_digest, cash_out_receipt,
     ed25519_dalek::Signature,
 };
 use sha2::Sha256;
@@ -75,7 +75,7 @@ pub struct Opening {
 pub struct Receipt {
     pub index: u64,
     pub account_id: AccountId,
-    pub points: u128,
+    pub points: Points,
 }
 
 struct ReceiptKeys {
@@ -358,11 +358,13 @@ impl<'wallet> Referral<'wallet> {
     pub async fn claimable(
         &mut self,
         participant: AccountId,
-    ) -> Result<u128, ExecutionFailureKind> {
+    ) -> Result<Points, ExecutionFailureKind> {
         self.batches(participant)
             .await?
             .iter()
-            .try_fold(0, |sum: u128, (_operation, total)| sum.checked_add(*total))
+            .try_fold(0, |sum: Points, (_operation, total)| {
+                sum.checked_add(*total)
+            })
             .ok_or_else(|| conflict("the claimable total overflows"))
     }
 
@@ -381,7 +383,7 @@ impl<'wallet> Referral<'wallet> {
     async fn batches(
         &mut self,
         participant: AccountId,
-    ) -> Result<Vec<(OperationKind, u128)>, ExecutionFailureKind> {
+    ) -> Result<Vec<(OperationKind, Points)>, ExecutionFailureKind> {
         let claimant = self.participant(participant)?;
         let registry = self.registry().await?;
         let current = (registry.epoch, active_digest(&registry.active));
@@ -436,7 +438,7 @@ impl<'wallet> Referral<'wallet> {
     async fn publication(
         &mut self,
         registry: &Registry,
-        epoch: u32,
+        epoch: Epoch,
         digest: [u8; 32],
     ) -> Result<BTreeSet<NodeId>, ExecutionFailureKind> {
         if (registry.epoch, active_digest(&registry.active)) == (epoch, digest) {
@@ -503,7 +505,7 @@ impl<'wallet> Referral<'wallet> {
 
     pub async fn publish(
         &self,
-        epoch: u32,
+        epoch: Epoch,
         active: BTreeSet<NodeId>,
     ) -> Result<HashType, ExecutionFailureKind> {
         let program_account = self.program_account();
@@ -1089,7 +1091,7 @@ fn decode_registry(
 fn claim_for(
     mut claimant: Participant,
     states: Vec<State>,
-    epoch: u32,
+    epoch: Epoch,
     digest: [u8; 32],
     collects: bool,
     active: BTreeSet<NodeId>,

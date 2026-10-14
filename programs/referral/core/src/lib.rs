@@ -21,6 +21,12 @@ const AUTHORIZATION_DOMAIN: &[u8; 37] = b"LEZ/Referral/AuthorizeParticipant/v1\0
 
 const CASH_OUT_DOMAIN: &[u8; 24] = b"LEZ/Referral/CashOut/v1\0";
 
+/// An epoch, numbered by the oracle's publications.
+pub type Epoch = u32;
+
+/// Referral reward points. Not a native token amount: points move only inside this program.
+pub type Points = u128;
+
 #[derive(
     Clone,
     Copy,
@@ -75,7 +81,7 @@ impl Invitation {
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Registry {
     pub nodes: BTreeSet<NodeId>,
-    pub epoch: u32,
+    pub epoch: Epoch,
     pub active: BTreeSet<NodeId>,
 }
 
@@ -83,8 +89,8 @@ pub struct Registry {
 pub struct Participant {
     pub node: NodeId,
     pub referrer: Option<NodeId>,
-    pub children: BTreeMap<NodeId, u32>,
-    pub reward_balance: u128,
+    pub children: BTreeMap<NodeId, Epoch>,
+    pub reward_balance: Points,
 }
 
 impl Participant {
@@ -99,9 +105,9 @@ impl Participant {
     }
 
     #[must_use]
-    pub fn claim(&mut self, epoch: u32, active: &BTreeSet<NodeId>, notes: &[State]) -> u128 {
+    pub fn claim(&mut self, epoch: Epoch, active: &BTreeSet<NodeId>, notes: &[State]) -> Points {
         self.assert_active(active);
-        let mut total: u128 = 0;
+        let mut total: Points = 0;
         for note in notes {
             match *note {
                 State::Child { node, referrer } => {
@@ -128,12 +134,12 @@ impl Participant {
     }
 
     #[must_use]
-    pub fn collect_credits(&mut self, active: &BTreeSet<NodeId>, notes: &[State]) -> u128 {
+    pub fn collect_credits(&mut self, active: &BTreeSet<NodeId>, notes: &[State]) -> Points {
         self.assert_active(active);
         let total = notes
             .iter()
             .map(|note| self.credit(note))
-            .try_fold(0, u128::checked_add)
+            .try_fold(0, Points::checked_add)
             .expect("credit total fits in u128");
         self.add_reward(total)
     }
@@ -145,7 +151,7 @@ impl Participant {
         );
     }
 
-    fn credit(&self, note: &State) -> u128 {
+    fn credit(&self, note: &State) -> Points {
         let State::Credit {
             recipient_node,
             amount,
@@ -161,7 +167,7 @@ impl Participant {
         amount
     }
 
-    const fn add_reward(&mut self, total: u128) -> u128 {
+    const fn add_reward(&mut self, total: Points) -> Points {
         self.reward_balance = self
             .reward_balance
             .checked_add(total)
@@ -180,12 +186,12 @@ pub enum State {
     },
     Credit {
         recipient_node: NodeId,
-        amount: u128,
-        epoch: u32,
+        amount: Points,
+        epoch: Epoch,
         active_digest: [u8; 32],
     },
     CashOut {
-        points: u128,
+        points: Points,
     },
 }
 
@@ -251,10 +257,10 @@ impl ParticipantAuthorizationV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Claim {
-    pub epoch: u32,
+    pub epoch: Epoch,
     pub active: BTreeSet<NodeId>,
     pub notes: Vec<State>,
-    pub total: u128,
+    pub total: Points,
     pub referrer: Option<NodeId>,
 }
 
@@ -274,14 +280,14 @@ pub enum Instruction {
         pool: BTreeSet<NodeId>,
     },
     Publish {
-        epoch: u32,
+        epoch: Epoch,
         active: BTreeSet<NodeId>,
     },
     Claim(Claim),
     CollectCredits(Claim),
     CashOut {
         node: NodeId,
-        points: u128,
+        points: Points,
         blinding_factor: [u8; 32],
     },
 }
@@ -289,7 +295,7 @@ pub enum Instruction {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Effect {
     Publish {
-        epoch: u32,
+        epoch: Epoch,
         active: BTreeSet<NodeId>,
     },
     Register {
@@ -297,7 +303,7 @@ pub enum Effect {
         pool: BTreeSet<NodeId>,
     },
     CheckEpoch {
-        epoch: u32,
+        epoch: Epoch,
         active_digest: [u8; 32],
     },
     Create(State),
@@ -306,7 +312,7 @@ pub enum Effect {
     Consume(State),
     CashOutBurn {
         node: NodeId,
-        points: u128,
+        points: Points,
     },
 }
 

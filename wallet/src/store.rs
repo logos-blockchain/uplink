@@ -10,7 +10,7 @@ use common::HashType;
 use lee::AccountId;
 use lee_core::{BlockId, Commitment, Identifier};
 use rand::{RngCore as _, rngs::OsRng};
-use referral_core::{Invitation, NodeId, active_digest, ed25519_dalek::Signature};
+use referral_core::{Epoch, Invitation, NodeId, active_digest, ed25519_dalek::Signature};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +24,7 @@ pub struct ReferralStore {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Publication {
     pub program_account: AccountId,
-    pub epoch: u32,
+    pub epoch: Epoch,
     pub active: BTreeSet<NodeId>,
 }
 
@@ -50,13 +50,13 @@ pub enum OperationKind {
     Claim {
         participant: AccountId,
         notes: Vec<AccountId>,
-        epoch: u32,
+        epoch: Epoch,
         active_digest: [u8; 32],
     },
     CollectCredits {
         participant: AccountId,
         notes: Vec<AccountId>,
-        epoch: u32,
+        epoch: Epoch,
         active_digest: [u8; 32],
     },
     CashOut {
@@ -79,7 +79,10 @@ pub enum RegistryGuard {
     /// A registration, which fails once its node is registered.
     Registers { node: NodeId },
     /// A claim, which fails once the registry holds another publication.
-    ChecksEpoch { epoch: u32, active_digest: [u8; 32] },
+    ChecksEpoch {
+        epoch: Epoch,
+        active_digest: [u8; 32],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,7 +144,7 @@ impl ReferralStore {
     pub fn publication(
         &self,
         program_account: AccountId,
-        epoch: u32,
+        epoch: Epoch,
         digest: [u8; 32],
     ) -> Option<&BTreeSet<NodeId>> {
         self.publications

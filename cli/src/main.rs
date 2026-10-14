@@ -14,7 +14,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use lee::AccountId;
 use rand::RngCore as _;
-use referral_core::{Invitation, NodeId, State};
+use referral_core::{Epoch, Invitation, NodeId, State};
 use referral_methods::referral;
 use uplink_wallet::{Referral, store::OperationKind};
 use url::Url;
@@ -119,7 +119,7 @@ enum Command {
     /// Publish an epoch's active nodes. Signed by the oracle account, which this wallet must hold.
     Publish {
         #[arg(long)]
-        epoch: u32,
+        epoch: Epoch,
         /// Active nodes, as hex.
         #[arg(long = "active", value_parser = parse_node)]
         active: Vec<NodeId>,

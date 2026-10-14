@@ -4,7 +4,7 @@ use lee_core::{
 };
 pub use referral_core as core;
 use referral_core::{
-    Claim, Effect, Instruction, ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1,
+    Claim, Effect, Instruction, ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1, Points,
     Registry, State, active_digest, cash_out_receipt,
 };
 
@@ -248,7 +248,7 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
 fn settle(
     pre_data: &ShardData,
     claim: &Claim,
-    transition: impl FnOnce(&mut Participant) -> u128,
+    transition: impl FnOnce(&mut Participant) -> Points,
 ) -> ShardData {
     let mut participant = decode_participant(pre_data);
     assert_eq!(
