@@ -1,0 +1,31 @@
+[package]
+name = "referral_methods"
+version = "0.1.0"
+edition = "2024"
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "referral"
+path = "src/main.rs"
+required-features = ["guest"]
+
+[features]
+default = ["artifacts"]
+
+# Library target only: embeds the reproducibly built binary from `artifacts/programs/referral/` and
+# packs it into a `Program`.
+artifacts = ["dep:build_utils", "dep:lee"]
+
+# Dependencies of the guest binary, built for the zkVM by `just build-artifacts`.
+guest = ["dep:lee_core", "dep:referral_program"]
+
+[dependencies]
+lee = { workspace = true, optional = true }
+lee_core = { workspace = true, optional = true }
+referral_program = { workspace = true, optional = true }
+
+[build-dependencies]
+build_utils = { workspace = true, optional = true }
