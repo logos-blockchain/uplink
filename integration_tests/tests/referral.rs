@@ -15,8 +15,7 @@ use key_protocol::key_management::secret_holders::SeedHolder;
 use lee::{AccountId, PrivateKey};
 use program_loader_core::MAX_SEGMENT_DATA_LEN;
 use referral_core::{
-    Invitation, NodeId, ORACLE_ACCOUNT_ID, PROTOTYPE_ORACLE_SIGNING_KEY, State, active_digest,
-    cash_out_receipt,
+    Invitation, NodeId, ORACLE_ACCOUNT_ID, State, active_digest, cash_out_receipt,
     ed25519_dalek::{Signer as _, SigningKey},
 };
 use referral_methods::referral;
@@ -24,9 +23,12 @@ use testnet_initial_state::{PublicAccountPrivateInitialData, initial_pub_account
 use tokio::test;
 use uplink_wallet::{
     Referral, receipt_secret,
-    store::{OperationKind, SubmissionStatus},
+    store::{ClaimedEpoch, OperationKind, SubmissionStatus},
 };
 use wallet::{cli::execute_keys_restoration, program_facades::program_loader::ProgramLoader};
+
+/// The key behind `ORACLE_ACCOUNT_ID` in this prototype, with which the tests publish epochs.
+const PROTOTYPE_ORACLE_SIGNING_KEY: [u8; 32] = [11; 32];
 
 const ORACLE_FUNDING: u128 = 100_000_000_000;
 
@@ -169,9 +171,11 @@ async fn current_claim(
     let registry = facade(ctx, program).registry().await?;
     Ok(OperationKind::Claim {
         participant,
-        notes: note_ids(ctx, program, participant)?,
-        epoch: registry.epoch,
-        active_digest: active_digest(&registry.active),
+        epochs: vec![ClaimedEpoch {
+            epoch: registry.epoch,
+            active_digest: active_digest(&registry.active_nodes),
+            notes: note_ids(ctx, program, participant)?,
+        }],
     })
 }
 
@@ -208,6 +212,8 @@ async fn publish(
         .publish(epoch, active.iter().copied().collect())
         .await?;
     ctx.wallet().poll_transaction(hash).await?;
+    // Claims read past epochs' active sets back from the indexer.
+    wait_for_indexer_to_catch_up(ctx).await?;
     Ok(())
 }
 
@@ -314,6 +320,7 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
         vec![State::Child {
             node: alice_node,
             referrer: carol_node,
+            since: 0,
         }],
         "Carol holds Alice's announcement and no credit for an epoch she was inactive in"
     );
@@ -411,27 +418,26 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
         3,
         "Bob is active in the third epoch"
     );
-    let carol_stale = current_claim(&mut ctx, program, carol).await?;
+    let carol_late = current_claim(&mut ctx, program, carol).await?;
 
+    // Publications never change, so a claim for epoch 3 stays valid after epoch 4 is published;
+    // building it now reads epoch 3's active set back from the indexer.
     publish(&mut ctx, program, 4, &[bob_node]).await?;
-    let carol_stale_refused = facade(&mut ctx, program)
-        .submit([10; 32], carol_stale)
-        .await;
-    assert!(
-        carol_stale_refused.is_err(),
-        "a claim built for a superseded publication is refused: {carol_stale_refused:?}"
+    let (hash, _broadcast) = facade(&mut ctx, program)
+        .submit([10; 32], carol_late)
+        .await?;
+    ctx.wallet().poll_transaction(hash).await?;
+    settle(&mut ctx, program, [10; 32]).await?;
+    sync_private(&mut ctx).await?;
+    assert_eq!(
+        reward_balance(&mut ctx, program, carol)?,
+        5,
+        "a claim for a past epoch pays its active child and the credit forwarded in it"
     );
-
-    wait_for_indexer_to_catch_up(&ctx).await?;
     assert_eq!(
         facade(&mut ctx, program).claimable(carol).await?,
-        1,
-        "the third epoch's credit outlives its publication although Carol is inactive now"
-    );
-    assert_eq!(
-        claim(&mut ctx, program, carol, [11; 32]).await?,
-        4,
-        "collected against the indexer's history of publications"
+        0,
+        "Carol is inactive in the fourth epoch, and the third is settled"
     );
 
     Ok(())
@@ -520,6 +526,74 @@ async fn registration_bookkeeping_resumes_and_refuses_conflicts() -> Result<()> 
         facade(&mut ctx, program).operation_status([0x77; 32]),
         None,
         "the refused registration is never recorded"
+    );
+
+    Ok(())
+}
+
+#[test]
+async fn a_slack_referrer_catches_up_in_one_claim_from_each_childs_registration() -> Result<()> {
+    let mut ctx = TestContext::new().await?;
+    let payer = genesis_payer(&mut ctx);
+    let program = deploy_referral(&mut ctx, payer.account_id).await?;
+    fund_oracle(&mut ctx, payer.account_id).await?;
+
+    let (carol_key, carol_node) = node(3);
+    let (alice_key, alice_node) = node(2);
+    let (dave_key, dave_node) = node(4);
+    let carol = facade(&mut ctx, program).create_participant()?;
+    let alice = facade(&mut ctx, program).create_participant()?;
+    let dave = facade(&mut ctx, program).create_participant()?;
+    register(&mut ctx, program, carol, &carol_key, None, None).await?;
+    let carol_invites_alice = facade(&mut ctx, program).invitation(carol, carol_node)?;
+    register(
+        &mut ctx,
+        program,
+        alice,
+        &alice_key,
+        Some(carol_node),
+        Some(carol_invites_alice),
+    )
+    .await?;
+
+    // Dave runs a node from the first epoch, but registers under Carol only in the third.
+    for epoch in 1..=3 {
+        publish(
+            &mut ctx,
+            program,
+            epoch,
+            &[alice_node, carol_node, dave_node],
+        )
+        .await?;
+    }
+    let carol_invites_dave = facade(&mut ctx, program).invitation(carol, carol_node)?;
+    register(
+        &mut ctx,
+        program,
+        dave,
+        &dave_key,
+        Some(carol_node),
+        Some(carol_invites_dave),
+    )
+    .await?;
+
+    assert_eq!(
+        facade(&mut ctx, program)
+            .claim_operations(carol)
+            .await?
+            .len(),
+        1,
+        "one claim settles the three epochs Carol did not claim"
+    );
+    assert_eq!(
+        claim(&mut ctx, program, carol, [1; 32]).await?,
+        4,
+        "three epochs of Alice, and of Dave only the epoch he registered in"
+    );
+    assert_eq!(
+        facade(&mut ctx, program).claimable(carol).await?,
+        0,
+        "every epoch pays each child once"
     );
 
     Ok(())
@@ -621,7 +695,7 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
     for (index, sent_to) in (0..).zip(&sent) {
         let opening = facade(&mut ctx, program).opening(carol, index, &rederived_secret)?;
         assert_eq!(
-            cash_out_receipt(opening.program_account, carol_node, opening.blinding_factor),
+            cash_out_receipt(opening.uplink_account, carol_node, opening.blinding_factor),
             *sent_to,
             "the recovered opening recomputes the receipt its cash out sent"
         );

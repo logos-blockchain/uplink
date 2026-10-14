@@ -31,7 +31,7 @@ struct Args {
     /// `derive-receipt-secret`.
     #[arg(long, env = "UPLINK_PROGRAM")]
     program: Option<AccountId>,
-    /// Indexer endpoint, needed to collect credits earned in past epochs.
+    /// Indexer endpoint, needed to claim any epoch but the current one.
     #[arg(long, env = "UPLINK_INDEXER")]
     indexer: Option<Url>,
     #[command(subcommand)]
@@ -101,7 +101,12 @@ enum Command {
         #[arg(long, value_parser = parse_reference)]
         reference: Option<[u8; 32]>,
     },
-    /// Claim everything claimable: this epoch's rewards and credits from past epochs.
+    /// Print what claiming now would pay, without claiming.
+    Claimable {
+        #[arg(long)]
+        participant: AccountId,
+    },
+    /// Claim every epoch not yet settled, oldest first, in as many claims as the batch caps need.
     Claim {
         #[arg(long)]
         participant: AccountId,
@@ -233,6 +238,9 @@ async fn run(facade: &mut Referral<'_>, command: Command) -> Result<()> {
             participant,
             reference,
         } => submit(facade, reference, OperationKind::Register { participant }).await?,
+        Command::Claimable { participant } => {
+            println!("{}", facade.claimable(participant).await?);
+        }
         Command::Claim { participant } => {
             let operations = facade.claim_operations(participant).await?;
             if operations.is_empty() {
@@ -273,7 +281,7 @@ async fn run(facade: &mut Referral<'_>, command: Command) -> Result<()> {
             receipt_secret,
         } => {
             let opening = facade.opening(participant, index, &receipt_secret.read()?)?;
-            println!("program\t{}", opening.program_account);
+            println!("program\t{}", opening.uplink_account);
             println!("node\t{}", hex::encode(opening.node.to_bytes()));
             println!("blinding_factor\t{}", hex::encode(opening.blinding_factor));
             println!("receipt\t{}", opening.account_id);
@@ -302,9 +310,46 @@ fn show(facade: &Referral<'_>, participant: AccountId) -> Result<()> {
                     .map_or_else(|| "none".to_owned(), |node| hex::encode(node.to_bytes()))
             );
             println!("children\t{}", state.children.len());
+            for (child, settled) in &state.children {
+                println!(
+                    "child\t{}\tsettled {}",
+                    hex::encode(child.to_bytes()),
+                    settled_epochs(settled)
+                );
+            }
             println!("reward_balance\t{}", state.reward_balance);
+
+            let mut announced = 0_usize;
+            let mut credit_epochs = BTreeSet::new();
+            let mut credits = 0_usize;
+            for (_id, note) in facade.notes(participant)? {
+                match note {
+                    State::Child { .. } => announced = announced.saturating_add(1),
+                    State::Credit { epoch, .. } => {
+                        credits = credits.saturating_add(1);
+                        credit_epochs.insert(epoch);
+                    }
+                    State::Registry(_)
+                    | State::Participant(_)
+                    | State::CashOut { .. }
+                    | State::Publication { .. } => {}
+                }
+            }
+            let epochs: Vec<String> = credit_epochs.iter().map(ToString::to_string).collect();
+            println!(
+                "pending_notes\t{announced} child announced, {credits} credits{}",
+                if epochs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (epochs {})", epochs.join(", "))
+                }
+            );
         }
-        State::Registry(_) | State::Child { .. } | State::Credit { .. } | State::CashOut { .. } => {
+        State::Registry(_)
+        | State::Child { .. }
+        | State::Credit { .. }
+        | State::CashOut { .. }
+        | State::Publication { .. } => {
             bail!("{participant} does not hold a participant")
         }
     }
@@ -342,6 +387,24 @@ fn print_submission(
         "reference {}\ttransaction {hash}\t{status:?}",
         hex::encode(reference)
     );
+}
+
+/// Settled epoch ranges as `1-3,5`, or `none`.
+fn settled_epochs(settled: &[(Epoch, Epoch)]) -> String {
+    if settled.is_empty() {
+        return "none".to_owned();
+    }
+    settled
+        .iter()
+        .map(|&(first, last)| {
+            if first == last {
+                first.to_string()
+            } else {
+                format!("{first}-{last}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn read_hex_file(path: &Path) -> Result<[u8; 32]> {
@@ -387,4 +450,16 @@ fn parse_array<const N: usize>(text: &str) -> Result<[u8; N]> {
     bytes
         .try_into()
         .map_err(|bytes: Vec<u8>| anyhow::anyhow!("Expected {N} bytes, got {}", bytes.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settled_epochs_print_as_ranges() {
+        assert_eq!(settled_epochs(&[]), "none");
+        assert_eq!(settled_epochs(&[(0, 2)]), "0-2");
+        assert_eq!(settled_epochs(&[(1, 3), (5, 5), (7, 9)]), "1-3,5,7-9");
+    }
 }

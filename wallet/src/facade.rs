@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
 };
 
@@ -18,9 +18,9 @@ use lee_core::{
     program::InstructionData,
 };
 use referral_core::{
-    Claim, Effect, Epoch, Instruction, Invitation, NodeId, ORACLE_ACCOUNT_ID, Participant,
-    ParticipantAuthorizationV1, Points, Referrer, Registry, State, active_digest, blinding_factor,
-    cash_out_receipt, ed25519_dalek::Signature,
+    Claim, Effect, Epoch, EpochClaim, Instruction, Invitation, NodeId, ORACLE_ACCOUNT_ID,
+    Participant, ParticipantAuthorizationV1, Points, Referrer, Registry, State, active_digest,
+    blinding_factor, cash_out_receipt, ed25519_dalek::Signature, epoch_account,
 };
 use url::Url;
 use wallet::{
@@ -29,8 +29,8 @@ use wallet::{
 };
 
 use crate::store::{
-    OperationKind, PendingOperation, PendingRegistration, Publication, ReferralIntent,
-    ReferralStore, RegistryGuard, SubmissionStatus, random_identifier,
+    ClaimedEpoch, OperationKind, PendingOperation, PendingRegistration, Publication,
+    ReferralIntent, ReferralStore, RegistryGuard, SubmissionStatus, random_identifier,
 };
 
 const HISTORY_PAGE_LIMIT: u64 = 10;
@@ -38,6 +38,13 @@ const HISTORY_PAGE_LIMIT: u64 = 10;
 /// Blocks after which a sent attempt that is neither included nor outspent counts as lost, and a
 /// later submit builds it again. Both attempts spend the same inputs, so at most one is included.
 const RESUBMIT_AFTER_BLOCKS: BlockId = 20;
+
+/// Most epochs one claim settles. A claim's proof grows with every epoch it carries.
+const MAX_CLAIM_EPOCHS: usize = 16;
+
+/// Most active-set entries one claim carries across its epochs, about 2,200 guest cycles each. An
+/// epoch whose set alone is larger still goes in a claim of its own.
+const MAX_CLAIM_ACTIVE_ENTRIES: usize = 2_048;
 
 /// File name of the referral store, kept next to the wallet's own storage.
 const STORE_FILE_NAME: &str = "referral.json";
@@ -61,7 +68,7 @@ struct Request {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Opening {
-    pub program_account: AccountId,
+    pub uplink_account: AccountId,
     pub node: NodeId,
     pub blinding_factor: [u8; 32],
     pub account_id: AccountId,
@@ -75,7 +82,7 @@ pub struct Receipt {
 }
 
 struct ReceiptKeys {
-    program_account: AccountId,
+    uplink_account: AccountId,
     participant: AccountId,
     node: NodeId,
     receipt_secret: [u8; 32],
@@ -85,34 +92,34 @@ impl ReceiptKeys {
     fn opening(&self, index: u64) -> Opening {
         let blinding_factor = blinding_factor(
             &self.receipt_secret,
-            self.program_account,
+            self.uplink_account,
             self.participant,
             index,
         );
         Opening {
-            program_account: self.program_account,
+            uplink_account: self.uplink_account,
             node: self.node,
             blinding_factor,
-            account_id: cash_out_receipt(self.program_account, self.node, blinding_factor),
+            account_id: cash_out_receipt(self.uplink_account, self.node, blinding_factor),
         }
     }
 }
 
 impl<'wallet> Referral<'wallet> {
-    /// Opens the referral deployment at `program_account` over `wallet`, with the referral store
+    /// Opens the referral deployment at `uplink_account` over `wallet`, with the referral store
     /// that sits next to the wallet's storage.
     pub fn new(
         wallet: &'wallet mut WalletCore,
         program: Program,
-        program_account: AccountId,
+        uplink_account: AccountId,
     ) -> Result<Self, ExecutionFailureKind> {
         let store_path = Self::store_path(wallet);
         let store =
             ReferralStore::load(&store_path).map_err(ExecutionFailureKind::SequencerError)?;
-        let dependencies = HashMap::from([(program_account, program.clone())]);
+        let dependencies = HashMap::from([(uplink_account, program.clone())]);
         Ok(Self {
             wallet,
-            program: ProgramWithDependencies::new(program, program_account, dependencies),
+            program: ProgramWithDependencies::new(program, uplink_account, dependencies),
             store,
             store_path,
             indexer_addr: None,
@@ -125,8 +132,8 @@ impl<'wallet> Referral<'wallet> {
         wallet.storage_path().with_file_name(STORE_FILE_NAME)
     }
 
-    /// Reads past publications from the indexer at `indexer_addr`, which collecting delayed
-    /// credits needs.
+    /// Reads past publications' active sets from the indexer at `indexer_addr`, which claiming any
+    /// epoch but the current one needs.
     #[must_use]
     pub fn with_indexer(mut self, indexer_addr: Url) -> Self {
         self.indexer_addr = Some(indexer_addr);
@@ -134,7 +141,7 @@ impl<'wallet> Referral<'wallet> {
     }
 
     #[must_use]
-    pub const fn program_account(&self) -> AccountId {
+    pub const fn uplink_account(&self) -> AccountId {
         self.program.self_account_id
     }
 
@@ -158,7 +165,7 @@ impl<'wallet> Referral<'wallet> {
 
     pub fn state(&self, account: AccountId) -> Result<State, ExecutionFailureKind> {
         let found = self.found(account)?;
-        State::decode(found.account.data.shard(self.program_account()))
+        State::decode(found.account.data.shard(self.uplink_account()))
             .ok_or(ExecutionFailureKind::AccountDataError(account))
     }
 
@@ -201,7 +208,7 @@ impl<'wallet> Referral<'wallet> {
         let mut intent = self
             .intent(participant)
             .cloned()
-            .unwrap_or_else(|| ReferralIntent::new(self.program_account()));
+            .unwrap_or_else(|| ReferralIntent::new(self.uplink_account()));
         let recorded = intent.registration.as_ref().map_or_else(
             || {
                 self.participant(participant)
@@ -226,11 +233,11 @@ impl<'wallet> Referral<'wallet> {
         node: NodeId,
         referrer: Option<NodeId>,
     ) -> Result<ParticipantAuthorizationV1, ExecutionFailureKind> {
-        let program_account = self.program_account();
+        let uplink_account = self.uplink_account();
         let mut intent = self
             .intent(participant)
             .cloned()
-            .unwrap_or_else(|| ReferralIntent::new(program_account));
+            .unwrap_or_else(|| ReferralIntent::new(uplink_account));
 
         if let Some(parent) = referrer
             && intent
@@ -249,7 +256,7 @@ impl<'wallet> Referral<'wallet> {
 
         match &intent.registration {
             Some(pending)
-                if intent.program_account == program_account
+                if intent.uplink_account == uplink_account
                     && pending.node == node
                     && pending.referrer == referrer => {}
             Some(_pending) => {
@@ -258,7 +265,7 @@ impl<'wallet> Referral<'wallet> {
                 ));
             }
             None => {
-                intent.program_account = program_account;
+                intent.uplink_account = uplink_account;
                 intent.registration = Some(PendingRegistration {
                     node,
                     referrer,
@@ -269,7 +276,7 @@ impl<'wallet> Referral<'wallet> {
         self.store_intent(participant, intent)?;
 
         Ok(ParticipantAuthorizationV1::new(
-            program_account,
+            uplink_account,
             node,
             participant,
             referrer,
@@ -292,7 +299,7 @@ impl<'wallet> Referral<'wallet> {
         pending.signature = Some(Signature::from_bytes(&signature));
 
         let authorization = ParticipantAuthorizationV1::new(
-            intent.program_account,
+            intent.uplink_account,
             pending.node,
             participant,
             pending.referrer,
@@ -305,25 +312,22 @@ impl<'wallet> Referral<'wallet> {
     }
 
     pub async fn registry(&self) -> Result<Registry, ExecutionFailureKind> {
-        let program_account = self.program_account();
+        let uplink_account = self.uplink_account();
         let account = self
             .wallet
-            .get_account_view(ProgramShardSelector::new(
-                ORACLE_ACCOUNT_ID,
-                program_account,
-            ))
+            .get_account_view(ProgramShardSelector::new(ORACLE_ACCOUNT_ID, uplink_account))
             .await
             .map_err(ExecutionFailureKind::SequencerError)?;
-        decode_registry(&account, program_account)
+        decode_registry(&account, uplink_account)
     }
 
     pub fn notes(
         &self,
         participant: AccountId,
     ) -> Result<Vec<(AccountId, State)>, ExecutionFailureKind> {
-        let program_account = self.program_account();
+        let uplink_account = self.uplink_account();
         let found = self.found(participant)?;
-        let me = decode_participant(found.account, program_account)?;
+        let me = decode_participant(found.account, uplink_account)?;
         let npk = found.key_chain.nullifier_public_key;
         Ok(self
             .wallet
@@ -332,11 +336,14 @@ impl<'wallet> Referral<'wallet> {
             .private_accounts()
             .filter(|note| note.key_chain.nullifier_public_key == npk)
             .filter_map(|note| {
-                let state = State::decode(note.account.data.shard(program_account))?;
+                let state = State::decode(note.account.data.shard(uplink_account))?;
                 let addressed = match state {
                     State::Child { referrer, .. } => referrer == me.node,
                     State::Credit { recipient_node, .. } => recipient_node == me.node,
-                    State::Registry(_) | State::Participant(_) | State::CashOut { .. } => false,
+                    State::Registry(_)
+                    | State::Participant(_)
+                    | State::CashOut { .. }
+                    | State::Publication { .. } => false,
                 };
                 addressed.then(|| {
                     let id = AccountId::for_private_account(
@@ -375,59 +382,122 @@ impl<'wallet> Referral<'wallet> {
             .collect())
     }
 
+    /// Plans the participant's claims: every published epoch it can still earn in, oldest first,
+    /// batched by [`MAX_CLAIM_EPOCHS`] and [`MAX_CLAIM_ACTIVE_ENTRIES`], each with what it pays.
+    ///
+    /// Epochs go in order, so each child is paid for every epoch it can be; the program would pay
+    /// an earlier epoch claimed later only its credits.
     async fn batches(
         &mut self,
         participant: AccountId,
     ) -> Result<Vec<(OperationKind, Points)>, ExecutionFailureKind> {
         let claimant = self.participant(participant)?;
         let registry = self.registry().await?;
-        let current = (registry.epoch, active_digest(&registry.active));
-        let mut groups = BTreeMap::from([(current, (Vec::new(), Vec::new()))]);
-        for (id, state) in self.notes(participant)? {
-            let group = if let State::Credit {
-                epoch,
-                active_digest: digest,
-                ..
-            } = state
-            {
-                (epoch, digest)
-            } else {
-                current
-            };
-            let (ids, states) = groups.entry(group).or_default();
-            ids.push(id);
-            states.push(state);
+        let notes = self.notes(participant)?;
+
+        let earliest = claimant
+            .children
+            .values()
+            .map(|settled| first_unsettled(settled))
+            .chain(notes.iter().map(|(_id, state)| match *state {
+                State::Child { since, .. } => since,
+                State::Credit { epoch, .. } => epoch,
+                State::Registry(_)
+                | State::Participant(_)
+                | State::CashOut { .. }
+                | State::Publication { .. } => Epoch::MAX,
+            }))
+            .min();
+        let Some(earliest) = earliest else {
+            return Ok(Vec::new());
+        };
+
+        // Announced children are adopted in the first epoch claimed, so simulate them adopted
+        // from the start: an epoch before the first one claimed pays nothing either way.
+        let (children, credits): (Vec<_>, Vec<_>) = notes
+            .into_iter()
+            .partition(|(_id, state)| matches!(state, State::Child { .. }));
+        let mut simulated = claimant.clone();
+        for (_id, child) in &children {
+            if let State::Child { node, since, .. } = *child {
+                simulated.adopt(node, since);
+            }
         }
 
-        let mut batches = Vec::new();
-        for ((epoch, digest), (notes, states)) in groups {
-            let collects = (epoch, digest) != current;
-            let active = self.publication(&registry, epoch, digest).await?;
+        let mut planned: Vec<(ClaimedEpoch, usize, Points)> = Vec::new();
+        for epoch in earliest.max(1)..=registry.epoch {
+            let Some(active) = self.published_active(&registry, epoch).await? else {
+                continue;
+            };
             if !active.contains(&claimant.node) {
                 continue;
             }
-            let total = claim_for(claimant.clone(), states, epoch, digest, collects, active)?.total;
-            if total == 0 {
-                continue;
+            let digest = active_digest(&active);
+            let (ids, states): (Vec<AccountId>, Vec<State>) = credits
+                .iter()
+                .filter(|(_id, state)| {
+                    matches!(*state, State::Credit { epoch: earned, active_digest: under, .. }
+                        if (earned, under) == (epoch, digest))
+                })
+                .cloned()
+                .unzip();
+            let entries = active.len();
+            let total = simulated.claim(&EpochClaim {
+                epoch,
+                active,
+                notes: states,
+                total: 0,
+            });
+            if total > 0 {
+                planned.push((
+                    ClaimedEpoch {
+                        epoch,
+                        active_digest: digest,
+                        notes: ids,
+                    },
+                    entries,
+                    total,
+                ));
             }
-            let operation = if collects {
-                OperationKind::CollectCredits {
-                    participant,
-                    notes,
-                    epoch,
-                    active_digest: digest,
-                }
-            } else {
-                OperationKind::Claim {
-                    participant,
-                    notes,
-                    epoch,
-                    active_digest: digest,
-                }
-            };
-            batches.push((operation, total));
         }
-        Ok(batches)
+        if let Some((first, _entries, _total)) = planned.first_mut() {
+            first
+                .notes
+                .splice(0..0, children.iter().map(|(id, _state)| *id));
+        }
+
+        batch_claims(participant, planned)
+    }
+
+    /// The active set of published `epoch`, checked against its publication account, or `None` if
+    /// the epoch was never published.
+    async fn published_active(
+        &mut self,
+        registry: &Registry,
+        epoch: Epoch,
+    ) -> Result<Option<BTreeSet<NodeId>>, ExecutionFailureKind> {
+        let uplink_account = self.uplink_account();
+        let account = self
+            .wallet
+            .get_account_view(ProgramShardSelector::new(
+                epoch_account(uplink_account, epoch),
+                uplink_account,
+            ))
+            .await
+            .map_err(ExecutionFailureKind::SequencerError)?;
+        let Some(State::Publication {
+            epoch: published,
+            active_digest: digest,
+        }) = State::decode(account.data.shard(uplink_account))
+        else {
+            return Ok(None);
+        };
+        if published != epoch {
+            return Err(conflict(
+                "an epoch account holds another epoch's publication",
+            ));
+        }
+        Ok(Some(self.publication(registry, epoch, digest).await?))
     }
 
     async fn publication(
@@ -436,26 +506,26 @@ impl<'wallet> Referral<'wallet> {
         epoch: Epoch,
         digest: [u8; 32],
     ) -> Result<BTreeSet<NodeId>, ExecutionFailureKind> {
-        if (registry.epoch, active_digest(&registry.active)) == (epoch, digest) {
-            return Ok(registry.active.clone());
+        if (registry.epoch, active_digest(&registry.active_nodes)) == (epoch, digest) {
+            return Ok(registry.active_nodes.clone());
         }
-        let program_account = self.program_account();
-        if let Some(active) = self.store.publication(program_account, epoch, digest) {
+        let uplink_account = self.uplink_account();
+        if let Some(active) = self.store.publication(uplink_account, epoch, digest) {
             return Ok(active.clone());
         }
         self.refresh_publications().await?;
         self.store
-            .publication(program_account, epoch, digest)
+            .publication(uplink_account, epoch, digest)
             .cloned()
             .ok_or_else(|| conflict("the active set of that publication is not available"))
     }
 
     async fn refresh_publications(&mut self) -> Result<(), ExecutionFailureKind> {
-        let program_account = self.program_account();
+        let uplink_account = self.uplink_account();
         let mut offset = self
             .store
             .history_offsets
-            .get(&program_account)
+            .get(&uplink_account)
             .copied()
             .unwrap_or(0);
         let indexer_addr = self
@@ -482,7 +552,7 @@ impl<'wallet> Referral<'wallet> {
                 .expect("the history offset fits in u64");
             found.extend(
                 page.iter()
-                    .filter_map(|transaction| published(transaction, program_account)),
+                    .filter_map(|transaction| published(transaction, uplink_account)),
             );
             if fetched < HISTORY_PAGE_LIMIT {
                 break;
@@ -494,7 +564,7 @@ impl<'wallet> Referral<'wallet> {
                     store.publications.push(publication);
                 }
             }
-            store.history_offsets.insert(program_account, offset);
+            store.history_offsets.insert(uplink_account, offset);
         })
     }
 
@@ -503,15 +573,16 @@ impl<'wallet> Referral<'wallet> {
         epoch: Epoch,
         active: BTreeSet<NodeId>,
     ) -> Result<HashType, ExecutionFailureKind> {
-        let program_account = self.program_account();
+        let uplink_account = self.uplink_account();
         self.wallet
             .send_pub_tx(
                 vec![
-                    AccountIdentity::Public(ORACLE_ACCOUNT_ID)
-                        .select_program_shard(program_account),
+                    AccountIdentity::Public(ORACLE_ACCOUNT_ID).select_program_shard(uplink_account),
+                    AccountIdentity::PublicNoSign(epoch_account(uplink_account, epoch))
+                        .select_program_shard(uplink_account),
                 ],
                 instruction_data(Instruction::Publish { epoch, active }),
-                program_account,
+                uplink_account,
             )
             .await
     }
@@ -585,10 +656,10 @@ impl<'wallet> Referral<'wallet> {
         operation: OperationKind,
         receipt_secret: Option<&[u8; 32]>,
     ) -> Result<(HashType, SubmissionStatus), ExecutionFailureKind> {
-        let program_account = self.program_account();
+        let uplink_account = self.uplink_account();
         let recorded = self.store.operation(reference).cloned();
         if let Some(recorded) = recorded {
-            if recorded.program_account != program_account || recorded.operation != operation {
+            if recorded.uplink_account != uplink_account || recorded.operation != operation {
                 return Err(conflict(
                     "this reference was already used for a different deployment or operation",
                 ));
@@ -637,9 +708,7 @@ impl<'wallet> Referral<'wallet> {
         if recorded.status != SubmissionStatus::Settled
             && let OperationKind::CashOut { receipt, .. } = recorded.operation
         {
-            let shard = self
-                .receipt_shard(recorded.program_account, receipt)
-                .await?;
+            let shard = self.receipt_shard(recorded.uplink_account, receipt).await?;
             return match cash_out_transition(recorded.status, &shard, self.is_outspent(&recorded)) {
                 Some(status) => self.set_status(reference, status),
                 None => Ok(recorded.status),
@@ -653,7 +722,7 @@ impl<'wallet> Referral<'wallet> {
             .wallet
             .get_account_view(ProgramShardSelector::new(
                 ORACLE_ACCOUNT_ID,
-                recorded.program_account,
+                recorded.uplink_account,
             ))
             .await
             .map_err(ExecutionFailureKind::SequencerError)?;
@@ -722,9 +791,10 @@ impl<'wallet> Referral<'wallet> {
     ) -> Result<PendingOperation, ExecutionFailureKind> {
         let request = match &operation {
             OperationKind::Register { participant } => self.register_request(*participant).await?,
-            OperationKind::Claim { .. } | OperationKind::CollectCredits { .. } => {
-                self.claim_request(&operation).await?
-            }
+            OperationKind::Claim {
+                participant,
+                epochs,
+            } => self.claim_request(*participant, epochs).await?,
             OperationKind::CashOut {
                 participant,
                 index,
@@ -761,7 +831,7 @@ impl<'wallet> Referral<'wallet> {
 
         Ok(PendingOperation {
             reference,
-            program_account: self.program_account(),
+            uplink_account: self.uplink_account(),
             operation,
             hash,
             sent_at_block,
@@ -775,16 +845,16 @@ impl<'wallet> Referral<'wallet> {
         &self,
         participant: AccountId,
     ) -> Result<Request, ExecutionFailureKind> {
-        let program_account = self.program_account();
+        let uplink_account = self.uplink_account();
         let (node, referrer, node_signature) = self
             .pending_registration(participant)
             .and_then(|pending| Some((pending.node, pending.referrer, pending.signed()?)))
             .ok_or_else(|| conflict("this participant has no signed registration"))?;
         let registry = self.registry().await?;
-        if registry.nodes.contains(&node) {
+        if registry.registered_nodes.contains(&node) {
             return Err(conflict("this node is already registered"));
         }
-        if referrer.is_some_and(|parent| !registry.nodes.contains(&parent)) {
+        if referrer.is_some_and(|parent| !registry.registered_nodes.contains(&parent)) {
             return Err(conflict("the referrer is not registered"));
         }
 
@@ -804,8 +874,8 @@ impl<'wallet> Referral<'wallet> {
 
         let mut accounts = vec![
             self.own_private(participant)?
-                .select_program_shard(program_account),
-            AccountIdentity::PublicNoSign(ORACLE_ACCOUNT_ID).select_program_shard(program_account),
+                .select_program_shard(uplink_account),
+            AccountIdentity::PublicNoSign(ORACLE_ACCOUNT_ID).select_program_shard(uplink_account),
         ];
         self.deliver(referrer.as_ref(), &mut accounts);
 
@@ -815,104 +885,99 @@ impl<'wallet> Referral<'wallet> {
                 node,
                 referrer,
                 node_signature,
-                pool: registry.nodes,
+                pool: registry.registered_nodes,
+                epoch: registry.epoch,
             }),
             inputs: vec![participant],
-            registry_guard: Some(RegistryGuard::Registers { node }),
+            registry_guard: Some(RegistryGuard::Registers {
+                node,
+                epoch: registry.epoch,
+            }),
         })
     }
 
+    /// Builds a claim of `epochs` against the current state, so each epoch's total is what the
+    /// program will compute.
     async fn claim_request(
         &mut self,
-        operation: &OperationKind,
+        participant: AccountId,
+        epochs: &[ClaimedEpoch],
     ) -> Result<Request, ExecutionFailureKind> {
-        let (OperationKind::Claim {
-            participant,
-            notes,
-            epoch,
-            active_digest: digest,
-        }
-        | OperationKind::CollectCredits {
-            participant,
-            notes,
-            epoch,
-            active_digest: digest,
-        }) = operation
-        else {
-            unreachable!("only claims and credit collections build a claim")
-        };
-        let collects = matches!(operation, OperationKind::CollectCredits { .. });
         let registry = self.registry().await?;
-        if !collects && (registry.epoch, active_digest(&registry.active)) != (*epoch, *digest) {
-            return Err(conflict(
-                "the publication this claim was built for has changed",
-            ));
-        }
-        let active = self.publication(&registry, *epoch, *digest).await?;
-        let listed = self.notes(*participant)?;
-        let states = notes
-            .iter()
-            .map(|note| {
-                listed
-                    .iter()
-                    .find_map(|(id, state)| (id == note).then(|| state.clone()))
-                    .ok_or_else(|| conflict("this note is not addressed to the participant"))
-            })
-            .collect::<Result<_, _>>()?;
-        let claim = claim_for(
-            self.participant(*participant)?,
-            states,
-            *epoch,
-            *digest,
-            collects,
-            active,
-        )?;
-        if claim.total == 0 {
-            return Err(conflict("nothing to claim"));
-        }
+        let claimant = self.participant(participant)?;
+        let listed = self.notes(participant)?;
+        let uplink_account = self.uplink_account();
 
-        let program_account = self.program_account();
+        let mut simulated = claimant.clone();
         let mut accounts = vec![
-            self.own_private(*participant)?
-                .select_program_shard(program_account),
+            self.own_private(participant)?
+                .select_program_shard(uplink_account),
         ];
-        if !collects {
-            accounts.push(
-                AccountIdentity::PublicNoSign(ORACLE_ACCOUNT_ID)
-                    .select_program_shard(program_account),
-            );
-        }
-        for note in notes {
-            accounts.push(
-                self.own_private(*note)?
-                    .select_program_shard(program_account),
-            );
-        }
-        let forward_to = claim.forward_to();
-        let referrer = self
-            .participant(*participant)?
-            .referrer
-            .filter(|referrer| Some(referrer.node) == forward_to);
-        self.deliver(referrer.as_ref(), &mut accounts);
+        let mut inputs = vec![participant];
+        let mut claims = Vec::with_capacity(epochs.len());
+        for claimed in epochs {
+            let active = self
+                .published_active(&registry, claimed.epoch)
+                .await?
+                .ok_or_else(|| conflict("a claimed epoch was never published"))?;
+            if active_digest(&active) != claimed.active_digest {
+                return Err(conflict(
+                    "a claimed epoch was published with another active set",
+                ));
+            }
+            if !active.contains(&simulated.node) {
+                return Err(conflict("the participant cannot claim that epoch"));
+            }
+            let notes = claimed
+                .notes
+                .iter()
+                .map(|note| {
+                    listed
+                        .iter()
+                        .find_map(|(id, state)| (id == note).then(|| state.clone()))
+                        .ok_or_else(|| conflict("this note is not addressed to the participant"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut epoch_claim = EpochClaim {
+                epoch: claimed.epoch,
+                active,
+                notes,
+                total: 0,
+            };
+            let total = simulated.claim(&epoch_claim);
+            epoch_claim.total = total;
+            if total == 0 {
+                return Err(conflict("nothing to claim in a claimed epoch"));
+            }
 
-        let (instruction, registry_guard) = if collects {
-            (Instruction::CollectCredits(claim), None)
-        } else {
-            (
-                Instruction::Claim(claim),
-                Some(RegistryGuard::ChecksEpoch {
-                    epoch: *epoch,
-                    active_digest: *digest,
-                }),
-            )
-        };
+            accounts.push(
+                AccountIdentity::PublicNoSign(epoch_account(uplink_account, claimed.epoch))
+                    .select_program_shard(uplink_account),
+            );
+            for note in &claimed.notes {
+                accounts.push(
+                    self.own_private(*note)?
+                        .select_program_shard(uplink_account),
+                );
+            }
+            inputs.extend(claimed.notes.iter().copied());
+            let forward_to = epoch_claim.forward_to(claimant.referrer_node());
+            let referrer = claimant
+                .referrer
+                .as_ref()
+                .filter(|referrer| Some(referrer.node) == forward_to);
+            self.deliver(referrer, &mut accounts);
+            claims.push(epoch_claim);
+        }
+
         Ok(Request {
             accounts,
-            instruction: instruction_data(instruction),
-            inputs: std::iter::once(*participant)
-                .chain(notes.iter().copied())
-                .collect(),
-            registry_guard,
+            instruction: instruction_data(Instruction::Claim(Claim {
+                epochs: claims,
+                referrer: claimant.referrer_node(),
+            })),
+            inputs,
+            registry_guard: None,
         })
     }
 
@@ -923,7 +988,7 @@ impl<'wallet> Referral<'wallet> {
         receipt: AccountId,
         receipt_secret: &[u8; 32],
     ) -> Result<Request, ExecutionFailureKind> {
-        let program_account = self.program_account();
+        let uplink_account = self.uplink_account();
         let points = self.participant(participant)?.reward_balance;
         if points == 0 {
             return Err(conflict("nothing to cash out"));
@@ -944,9 +1009,9 @@ impl<'wallet> Referral<'wallet> {
         Ok(Request {
             accounts: vec![
                 self.own_private(participant)?
-                    .select_program_shard(program_account),
+                    .select_program_shard(uplink_account),
                 AccountIdentity::PublicNoSign(opening.account_id)
-                    .select_program_shard(program_account),
+                    .select_program_shard(uplink_account),
             ],
             instruction: instruction_data(Instruction::CashOut {
                 node: opening.node,
@@ -963,7 +1028,7 @@ impl<'wallet> Referral<'wallet> {
         let mut index = 0;
         loop {
             let account_id = keys.opening(index).account_id;
-            let shard = self.receipt_shard(keys.program_account, account_id).await?;
+            let shard = self.receipt_shard(keys.uplink_account, account_id).await?;
             if shard.is_empty() {
                 return Ok((receipts, index));
             }
@@ -984,7 +1049,7 @@ impl<'wallet> Referral<'wallet> {
         receipt_secret: &[u8; 32],
     ) -> Result<ReceiptKeys, ExecutionFailureKind> {
         Ok(ReceiptKeys {
-            program_account: self.program_account(),
+            uplink_account: self.uplink_account(),
             participant,
             node: self.participant(participant)?.node,
             receipt_secret: *receipt_secret,
@@ -993,21 +1058,21 @@ impl<'wallet> Referral<'wallet> {
 
     async fn receipt_shard(
         &self,
-        program_account: AccountId,
+        uplink_account: AccountId,
         receipt: AccountId,
     ) -> Result<ShardData, ExecutionFailureKind> {
         let account = self
             .wallet
-            .get_account_view(ProgramShardSelector::new(receipt, program_account))
+            .get_account_view(ProgramShardSelector::new(receipt, uplink_account))
             .await
             .map_err(ExecutionFailureKind::SequencerError)?;
-        Ok(account.data.shard(program_account).clone())
+        Ok(account.data.shard(uplink_account).clone())
     }
 
     /// Mentions a new note account addressed to `referrer`, if there is one to notify.
     fn deliver(&self, referrer: Option<&Referrer>, accounts: &mut Vec<AccountMention>) {
         if let Some(referrer) = referrer {
-            accounts.push(foreign_note(referrer).select_program_shard(self.program_account()));
+            accounts.push(foreign_note(referrer).select_program_shard(self.uplink_account()));
         }
     }
 
@@ -1076,7 +1141,7 @@ impl<'wallet> Referral<'wallet> {
     }
 
     fn participant(&self, account: AccountId) -> Result<Participant, ExecutionFailureKind> {
-        decode_participant(self.found(account)?.account, self.program_account())
+        decode_participant(self.found(account)?.account, self.uplink_account())
     }
 
     fn own_private(&self, account: AccountId) -> Result<AccountIdentity, ExecutionFailureKind> {
@@ -1096,9 +1161,9 @@ impl<'wallet> Referral<'wallet> {
 
 fn decode_participant(
     account: &Account,
-    program_account: AccountId,
+    uplink_account: AccountId,
 ) -> Result<Participant, ExecutionFailureKind> {
-    let Some(State::Participant(participant)) = State::decode(account.data.shard(program_account))
+    let Some(State::Participant(participant)) = State::decode(account.data.shard(uplink_account))
     else {
         return Err(conflict("this participant is not registered yet"));
     };
@@ -1107,81 +1172,90 @@ fn decode_participant(
 
 fn decode_registry(
     account: &Account,
-    program_account: AccountId,
+    uplink_account: AccountId,
 ) -> Result<Registry, ExecutionFailureKind> {
-    match State::decode(account.data.shard(program_account)) {
+    match State::decode(account.data.shard(uplink_account)) {
         None => Ok(Registry::default()),
         Some(State::Registry(registry)) => Ok(registry),
         Some(
             State::Participant(_)
             | State::Child { .. }
             | State::Credit { .. }
-            | State::CashOut { .. },
+            | State::CashOut { .. }
+            | State::Publication { .. },
         ) => Err(ExecutionFailureKind::AccountDataError(ORACLE_ACCOUNT_ID)),
     }
 }
 
-fn claim_for(
-    mut claimant: Participant,
-    states: Vec<State>,
-    epoch: Epoch,
-    digest: [u8; 32],
-    collects: bool,
-    active: BTreeSet<NodeId>,
-) -> Result<Claim, ExecutionFailureKind> {
-    if !active.contains(&claimant.node) {
-        return Err(conflict(
-            "the participant was not active in that publication",
+/// The first epoch not yet settled for a child, given its settled ranges. Epoch 0 is never
+/// published, so it counts as settled.
+fn first_unsettled(settled: &[(Epoch, Epoch)]) -> Epoch {
+    let mut next: Epoch = 1;
+    for &(first, last) in settled {
+        if first > next {
+            break;
+        }
+        next = next.max(last.saturating_add(1));
+    }
+    next
+}
+
+/// Splits a participant's planned epochs, in order, into claims of at most [`MAX_CLAIM_EPOCHS`]
+/// epochs and [`MAX_CLAIM_ACTIVE_ENTRIES`] active-set entries. An epoch over the entry cap on its
+/// own still gets a claim. Each planned epoch carries its active set's size and what it pays.
+fn batch_claims(
+    participant: AccountId,
+    planned: Vec<(ClaimedEpoch, usize, Points)>,
+) -> Result<Vec<(OperationKind, Points)>, ExecutionFailureKind> {
+    let mut batches: Vec<(OperationKind, Points)> = Vec::new();
+    let mut epochs = Vec::new();
+    let (mut entries, mut total): (usize, Points) = (0, 0);
+    for (claimed, epoch_entries, epoch_total) in planned {
+        let full = epochs.len() >= MAX_CLAIM_EPOCHS
+            || entries.saturating_add(epoch_entries) > MAX_CLAIM_ACTIVE_ENTRIES;
+        if full && !epochs.is_empty() {
+            batches.push((
+                OperationKind::Claim {
+                    participant,
+                    epochs: std::mem::take(&mut epochs),
+                },
+                total,
+            ));
+            (entries, total) = (0, 0);
+        }
+        epochs.push(claimed);
+        entries = entries.saturating_add(epoch_entries);
+        total = total
+            .checked_add(epoch_total)
+            .ok_or_else(|| conflict("the claimable total overflows"))?;
+    }
+    if !epochs.is_empty() {
+        batches.push((
+            OperationKind::Claim {
+                participant,
+                epochs,
+            },
+            total,
         ));
     }
-    for state in &states {
-        let belongs = match *state {
-            State::Credit {
-                epoch: earned,
-                active_digest: earned_under,
-                ..
-            } => (earned, earned_under) == (epoch, digest),
-            State::Child { .. } => !collects,
-            State::Registry(_) | State::Participant(_) | State::CashOut { .. } => false,
-        };
-        if !belongs {
-            return Err(conflict(
-                "this note does not belong to the claimed publication",
-            ));
-        }
-    }
-    let referrer = claimant.referrer_node();
-    let total = if collects {
-        claimant.collect_credits(&active, &states)
-    } else {
-        claimant.claim(epoch, &active, &states)
-    };
-    Ok(Claim {
-        epoch,
-        active,
-        notes: states,
-        total,
-        referrer,
-    })
+    Ok(batches)
 }
 
 fn is_superseded(
     recorded: &PendingOperation,
     registry: &Account,
 ) -> Result<bool, ExecutionFailureKind> {
-    let registry = decode_registry(registry, recorded.program_account)?;
+    let registry = decode_registry(registry, recorded.uplink_account)?;
     Ok(match recorded.registry_guard {
-        Some(RegistryGuard::Registers { node }) => registry.nodes.contains(&node),
-        Some(RegistryGuard::ChecksEpoch {
-            epoch,
-            active_digest: digest,
-        }) => registry.epoch != epoch || active_digest(&registry.active) != digest,
+        Some(RegistryGuard::Registers { node, epoch }) => {
+            registry.registered_nodes.contains(&node) || registry.epoch != epoch
+        }
         None => false,
     })
 }
 
-fn published(transaction: &IndexedTransaction, program_account: AccountId) -> Option<Publication> {
-    let program = *program_account.value();
+fn published(transaction: &IndexedTransaction, uplink_account: AccountId) -> Option<Publication> {
+    let program = *uplink_account.value();
     let (epoch, active) = match transaction {
         IndexedTransaction::Public(public) => {
             if public.message.program_account_id.value != program {
@@ -1210,7 +1284,7 @@ fn published(transaction: &IndexedTransaction, program_account: AccountId) -> Op
             })?,
     };
     Some(Publication {
-        program_account,
+        uplink_account,
         epoch,
         active,
     })
@@ -1259,11 +1333,11 @@ mod tests {
         }
     }
 
-    fn indexed_call(program_account: AccountId, instruction: &Instruction) -> IndexedTransaction {
+    fn indexed_call(uplink_account: AccountId, instruction: &Instruction) -> IndexedTransaction {
         IndexedTransaction::Public(indexer_service_protocol::PublicTransaction {
             hash: indexer_service_protocol::HashType([0; 32]),
             message: indexer_service_protocol::PublicMessage {
-                program_account_id: indexed_id(program_account),
+                program_account_id: indexed_id(uplink_account),
                 shard_selectors: Vec::new(),
                 nonces: Vec::new(),
                 instruction_data: borsh::to_vec(instruction).unwrap(),
@@ -1276,7 +1350,7 @@ mod tests {
         })
     }
 
-    fn indexed_effect(program_account: AccountId, effect: &Effect) -> IndexedTransaction {
+    fn indexed_effect(uplink_account: AccountId, effect: &Effect) -> IndexedTransaction {
         IndexedTransaction::PrivacyPreserving(
             indexer_service_protocol::PrivacyPreservingTransaction {
                 hash: indexer_service_protocol::HashType([0; 32]),
@@ -1284,8 +1358,8 @@ mod tests {
                     public_actions: vec![indexer_service_protocol::PublicActionWithID {
                         account_id: indexed_id(ORACLE_ACCOUNT_ID),
                         effects: vec![indexer_service_protocol::DeferredPublicEffect {
-                            program_account_id: indexed_id(program_account),
-                            shard_program_account_id: indexed_id(program_account),
+                            program_account_id: indexed_id(uplink_account),
+                            shard_program_account_id: indexed_id(uplink_account),
                             data: borsh::to_vec(effect).unwrap(),
                         }],
                     }],
@@ -1376,48 +1450,52 @@ mod tests {
     fn reconciliation_reads_the_recorded_deployment() {
         let ours = AccountId::new([1; 32]);
         let other = AccountId::new([2; 32]);
-        let active = BTreeSet::from([NodeId::new([9; 32])]);
-
-        let recorded = PendingOperation {
+        let node = NodeId::new([9; 32]);
+        let registering = |epoch| PendingOperation {
             reference: [0; 32],
-            program_account: ours,
-            operation: OperationKind::Claim {
+            uplink_account: ours,
+            operation: OperationKind::Register {
                 participant: AccountId::new([3; 32]),
-                notes: vec![],
-                epoch: 1,
-                active_digest: active_digest(&active),
             },
             hash: HashType([0; 32]),
             sent_at_block: 0,
-            registry_guard: Some(RegistryGuard::ChecksEpoch {
-                epoch: 1,
-                active_digest: active_digest(&active),
-            }),
+            registry_guard: Some(RegistryGuard::Registers { node, epoch }),
             input_commitments: Vec::new(),
             status: SubmissionStatus::Pending,
         };
+        let registry = |ours_epoch, ours_nodes: BTreeSet<NodeId>| {
+            Account::default()
+                .with_shard(
+                    ours,
+                    State::Registry(Registry {
+                        epoch: ours_epoch,
+                        registered_nodes: ours_nodes,
+                        ..Registry::default()
+                    })
+                    .to_data(),
+                )
+                .with_shard(
+                    other,
+                    State::Registry(Registry {
+                        epoch: 1,
+                        ..Registry::default()
+                    })
+                    .to_data(),
+                )
+        };
 
-        let registry = Account::default()
-            .with_shard(
-                ours,
-                State::Registry(Registry {
-                    epoch: 2,
-                    active: active.clone(),
-                    ..Registry::default()
-                })
-                .to_data(),
-            )
-            .with_shard(
-                other,
-                State::Registry(Registry {
-                    epoch: 1,
-                    active,
-                    ..Registry::default()
-                })
-                .to_data(),
-            );
-
-        assert!(is_superseded(&recorded, &registry).expect("registry decodes"));
+        assert!(
+            !is_superseded(&registering(1), &registry(1, BTreeSet::new())).unwrap(),
+            "the registration's epoch is still current"
+        );
+        assert!(
+            is_superseded(&registering(1), &registry(2, BTreeSet::new())).unwrap(),
+            "our deployment has moved on, whatever another deployment holds"
+        );
+        assert!(
+            is_superseded(&registering(1), &registry(1, BTreeSet::from([node]))).unwrap(),
+            "the node is already registered"
+        );
     }
 
     #[test]
@@ -1485,9 +1563,67 @@ mod tests {
         );
     }
 
-    fn keys(secret: u8, program_account: u8, participant: u8) -> ReceiptKeys {
+    fn planned(epoch: Epoch, entries: usize) -> (ClaimedEpoch, usize, Points) {
+        (
+            ClaimedEpoch {
+                epoch,
+                active_digest: [0; 32],
+                notes: Vec::new(),
+            },
+            entries,
+            1,
+        )
+    }
+
+    fn batch_sizes(planned: Vec<(ClaimedEpoch, usize, Points)>) -> Vec<(usize, Points)> {
+        batch_claims(AccountId::new([3; 32]), planned)
+            .unwrap()
+            .into_iter()
+            .map(|(operation, total)| {
+                let OperationKind::Claim { epochs, .. } = operation else {
+                    panic!("batching makes claims")
+                };
+                (epochs.len(), total)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_first_unsettled_epoch_follows_the_ranges_from_the_first_published_one() {
+        assert_eq!(first_unsettled(&[]), 1);
+        assert_eq!(first_unsettled(&[(1, 2)]), 3);
+        assert_eq!(first_unsettled(&[(0, 2)]), 3);
+        assert_eq!(first_unsettled(&[(0, 2), (4, 6)]), 3);
+        assert_eq!(first_unsettled(&[(2, 3)]), 1);
+    }
+
+    #[test]
+    fn claims_carry_at_most_the_epoch_cap() {
+        let epochs = (1..=20).map(|epoch| planned(epoch, 1)).collect();
+
+        assert_eq!(batch_sizes(epochs), vec![(16, 16), (4, 4)]);
+    }
+
+    #[test]
+    fn claims_carry_at_most_the_active_entry_cap_but_always_one_epoch() {
+        let epochs = vec![
+            planned(1, 1_500),
+            planned(2, 1_500),
+            planned(3, 5_000),
+            planned(4, 10),
+        ];
+
+        assert_eq!(batch_sizes(epochs), vec![(1, 1), (1, 1), (1, 1), (1, 1)]);
+        assert_eq!(
+            batch_sizes(vec![planned(1, 1_000), planned(2, 1_048)]),
+            vec![(2, 2)]
+        );
+        assert!(batch_sizes(Vec::new()).is_empty());
+    }
+
+    fn keys(secret: u8, uplink_account: u8, participant: u8) -> ReceiptKeys {
         ReceiptKeys {
-            program_account: AccountId::new([program_account; 32]),
+            uplink_account: AccountId::new([uplink_account; 32]),
             participant: AccountId::new([participant; 32]),
             node: NodeId::new([7; 32]),
             receipt_secret: [secret; 32],

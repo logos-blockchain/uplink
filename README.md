@@ -7,6 +7,26 @@ active, and every participant earns a point for each active node it referred dir
 lower in the tree are forwarded upward as credits. A participant can cash its points out into a
 public receipt that only it can link to its node.
 
+## Epochs and claims
+
+Each publication is archived when it is published: the epoch's active-set digest is written once to
+its own account, `epoch_account(uplink_account, epoch)`, and never changes. Epochs must increase, and each
+is published once, so the oracle cannot correct a publication.
+
+A claim settles one or more published epochs in increasing order, each against its archived
+publication, so a participant that claims late is still paid for every epoch it was active in. In
+each epoch it earns the credits earned in it, and settles the epoch for every child not yet settled
+for it, earning a point for each of those active in it. The total is forwarded to its referrer if
+the referrer was active in that epoch. A participant keeps, per child, the epochs settled for it as
+merged ranges, so epochs can be claimed in any order and none pays a child twice.
+
+Registration records the registry's current epoch, and a child counts from the epoch it registered
+in: the epochs before it count as settled. Since every child registers after its referrer, nobody
+earns anything for an epoch before they registered. The wallet reads past active sets from the
+indexer and checks each against its archived digest, claims epochs oldest first, and batches a
+catch-up into claims of at most 16 epochs and 2,048 active-set entries, about 2,200 guest cycles
+each.
+
 ## Layout
 
 | Path | Crate | What it holds |
@@ -54,11 +74,11 @@ operator derives once from the node's Ed25519 secret key (its 32-byte seed) and 
 participant's wallet:
 
 ```text
-receipt_secret     = SHA256("LEZ/Referral/ReceiptSecret/v1\0"  || node_secret)
-blinding_factor(i) = SHA256("LEZ/Referral/BlindingFactor/v1\0" || receipt_secret
-                            || program_account || participant || i as 8 little-endian bytes)
-receipt(i)         = public PDA of program_account with seed
-                     SHA256("LEZ/Referral/CashOut/v1\0" || node || blinding_factor(i))
+receipt_secret     = SHA256("Uplink/ReceiptSecret/v1\0"  || node_secret)
+blinding_factor(i) = SHA256("Uplink/BlindingFactor/v1\0" || receipt_secret
+                            || uplink_account || participant || i as 8 little-endian bytes)
+receipt(i)         = public PDA of uplink_account with seed
+                     SHA256("Uplink/CashOut/v1\0" || node || blinding_factor(i))
 ```
 
 The tags end in a zero byte, and every account and node is its 32 raw bytes. The program sees only

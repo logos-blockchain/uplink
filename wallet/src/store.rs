@@ -23,14 +23,14 @@ pub struct ReferralStore {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Publication {
-    pub program_account: AccountId,
+    pub uplink_account: AccountId,
     pub epoch: Epoch,
     pub active: BTreeSet<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferralIntent {
-    pub program_account: AccountId,
+    pub uplink_account: AccountId,
     pub registration: Option<PendingRegistration>,
     pub invitation: Option<Invitation>,
 }
@@ -49,15 +49,8 @@ pub enum OperationKind {
     },
     Claim {
         participant: AccountId,
-        notes: Vec<AccountId>,
-        epoch: Epoch,
-        active_digest: [u8; 32],
-    },
-    CollectCredits {
-        participant: AccountId,
-        notes: Vec<AccountId>,
-        epoch: Epoch,
-        active_digest: [u8; 32],
+        /// The claimed epochs, in strictly increasing order.
+        epochs: Vec<ClaimedEpoch>,
     },
     CashOut {
         participant: AccountId,
@@ -67,6 +60,14 @@ pub enum OperationKind {
     },
 }
 
+/// One epoch of a claim: its publication and the notes it consumes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimedEpoch {
+    pub epoch: Epoch,
+    pub active_digest: [u8; 32],
+    pub notes: Vec<AccountId>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubmissionStatus {
     Pending,
@@ -74,23 +75,21 @@ pub enum SubmissionStatus {
     Rejected,
 }
 
-/// What a submitted operation asserts about the public registry when it is included. The registry
-/// can move on while the operation waits, which supersedes it.
+/// What a submitted operation asserts about the public registry when it is included.
+///
+/// The registry can move on while the operation waits, which supersedes it. Claims check only
+/// immutable publications, so nothing supersedes them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegistryGuard {
-    /// A registration, which fails once its node is registered.
-    Registers { node: NodeId },
-    /// A claim, which fails once the registry holds another publication.
-    ChecksEpoch {
-        epoch: Epoch,
-        active_digest: [u8; 32],
-    },
+    /// A registration, which fails once its node is registered or the registry has published
+    /// another epoch than the one it records.
+    Registers { node: NodeId, epoch: Epoch },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingOperation {
     pub reference: [u8; 32],
-    pub program_account: AccountId,
+    pub uplink_account: AccountId,
     pub operation: OperationKind,
     /// The hash the sequencer returned for the transaction this attempt sent.
     pub hash: HashType,
@@ -145,14 +144,14 @@ impl ReferralStore {
     #[must_use]
     pub fn publication(
         &self,
-        program_account: AccountId,
+        uplink_account: AccountId,
         epoch: Epoch,
         digest: [u8; 32],
     ) -> Option<&BTreeSet<NodeId>> {
         self.publications
             .iter()
             .find(|publication| {
-                publication.program_account == program_account
+                publication.uplink_account == uplink_account
                     && publication.epoch == epoch
                     && active_digest(&publication.active) == digest
             })
@@ -162,9 +161,9 @@ impl ReferralStore {
 
 impl ReferralIntent {
     #[must_use]
-    pub const fn new(program_account: AccountId) -> Self {
+    pub const fn new(uplink_account: AccountId) -> Self {
         Self {
-            program_account,
+            uplink_account,
             registration: None,
             invitation: None,
         }
@@ -184,7 +183,6 @@ impl OperationKind {
         match self {
             Self::Register { participant }
             | Self::Claim { participant, .. }
-            | Self::CollectCredits { participant, .. }
             | Self::CashOut { participant, .. } => *participant,
         }
     }
@@ -216,17 +214,18 @@ mod tests {
 
     fn register_operation(
         reference: [u8; 32],
-        program_account: AccountId,
+        uplink_account: AccountId,
         participant: AccountId,
     ) -> PendingOperation {
         PendingOperation {
             reference,
-            program_account,
+            uplink_account,
             operation: OperationKind::Register { participant },
             hash: HashType([1; 32]),
             sent_at_block: 12,
             registry_guard: Some(RegistryGuard::Registers {
                 node: NodeId::new([7; 32]),
+                epoch: 2,
             }),
             input_commitments: Vec::new(),
             status: SubmissionStatus::Pending,
@@ -235,11 +234,11 @@ mod tests {
 
     #[test]
     fn the_store_round_trips_through_its_file() {
-        let program_account = AccountId::new([9; 32]);
+        let uplink_account = AccountId::new([9; 32]);
         let participant = AccountId::new([5; 32]);
         let mut store = ReferralStore::default();
 
-        let mut intent = ReferralIntent::new(program_account);
+        let mut intent = ReferralIntent::new(uplink_account);
         intent.registration = Some(PendingRegistration {
             node: NodeId::new([7; 32]),
             referrer: Some(NodeId::new([8; 32])),
@@ -251,7 +250,7 @@ mod tests {
             ViewingPublicKey::from_seed(&[2; 32], &[3; 32]),
         ));
         store.intents.insert(participant, intent);
-        store.record_operation(register_operation([7; 32], program_account, participant));
+        store.record_operation(register_operation([7; 32], uplink_account, participant));
         store.record_operation(PendingOperation {
             operation: OperationKind::CashOut {
                 participant,
@@ -259,27 +258,26 @@ mod tests {
                 receipt: AccountId::new([4; 32]),
             },
             registry_guard: None,
-            ..register_operation([8; 32], program_account, participant)
+            ..register_operation([8; 32], uplink_account, participant)
         });
         store.record_operation(PendingOperation {
-            operation: OperationKind::CollectCredits {
+            operation: OperationKind::Claim {
                 participant,
-                notes: vec![AccountId::new([6; 32])],
-                epoch: 4,
-                active_digest: [5; 32],
+                epochs: vec![ClaimedEpoch {
+                    epoch: 4,
+                    active_digest: [5; 32],
+                    notes: vec![AccountId::new([6; 32])],
+                }],
             },
-            registry_guard: Some(RegistryGuard::ChecksEpoch {
-                epoch: 4,
-                active_digest: [5; 32],
-            }),
-            ..register_operation([9; 32], program_account, participant)
+            registry_guard: None,
+            ..register_operation([9; 32], uplink_account, participant)
         });
         store.publications.push(Publication {
-            program_account,
+            uplink_account,
             epoch: 4,
             active: BTreeSet::from([NodeId::new([7; 32])]),
         });
-        store.history_offsets.insert(program_account, 11);
+        store.history_offsets.insert(uplink_account, 11);
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("referral.json");

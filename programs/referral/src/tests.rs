@@ -9,9 +9,10 @@ use lee_core::{
     program::{AccountMeta, Plan, PlanInput, ShardEffect},
 };
 use referral_core::{
-    Claim, Effect, Instruction, NodeId, ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1,
-    Referrer, Registry, State, active_digest, cash_out_receipt,
+    Claim, Effect, Epoch, EpochClaim, Instruction, NodeId, ORACLE_ACCOUNT_ID, Participant,
+    ParticipantAuthorizationV1, Referrer, Registry, State, active_digest, cash_out_receipt,
     ed25519_dalek::{Signer as _, SigningKey},
+    epoch_account,
 };
 
 const PROGRAM: AccountId = AccountId::new([9; 32]);
@@ -40,6 +41,19 @@ fn meta(account_id: AccountId, is_authorized: bool) -> AccountMeta {
     AccountMeta::new(account_id, is_authorized, PROGRAM)
 }
 
+/// The publication account of `epoch`, as a claim or a publish mentions it.
+fn publication(epoch: Epoch) -> AccountMeta {
+    meta(epoch_account(PROGRAM, epoch), false)
+}
+
+fn published(epoch: Epoch, active: &BTreeSet<NodeId>) -> ShardData {
+    State::Publication {
+        epoch,
+        active_digest: active_digest(active),
+    }
+    .to_data()
+}
+
 fn signature(
     key: &SigningKey,
     node: NodeId,
@@ -66,54 +80,83 @@ fn registry_data(registry: Registry) -> ShardData {
     State::Registry(registry).to_data()
 }
 
-fn claim(total: u128, referrer: Option<NodeId>) -> Claim {
-    Claim {
-        epoch: 0,
-        active: BTreeSet::new(),
-        notes: vec![],
+fn epoch_claim(
+    epoch: Epoch,
+    active: &BTreeSet<NodeId>,
+    notes: Vec<State>,
+    total: u128,
+) -> EpochClaim {
+    EpochClaim {
+        epoch,
+        active: active.clone(),
+        notes,
         total,
+    }
+}
+
+/// A one-epoch claim of epoch 1 with nothing in it but its total.
+fn claim(total: u128, active: &[NodeId], referrer: Option<NodeId>) -> Claim {
+    Claim {
+        epochs: vec![epoch_claim(
+            1,
+            &active.iter().copied().collect(),
+            vec![],
+            total,
+        )],
         referrer,
     }
 }
 
+// === Publish ===
+
 #[test]
-fn publish_replaces_the_epoch_and_the_active_set() {
+fn publish_archives_the_epoch_and_replaces_the_active_set() {
     let (_, a) = node(1);
+    let active = BTreeSet::from([a]);
     let effect = Effect::Publish {
         epoch: 2,
-        active: BTreeSet::new(),
+        active: active.clone(),
     };
+    let archive = Effect::Create(State::Publication {
+        epoch: 2,
+        active_digest: active_digest(&active),
+    });
 
     let plan = plan_for(
-        vec![meta(ORACLE_ACCOUNT_ID, true)],
+        vec![meta(ORACLE_ACCOUNT_ID, true), publication(2)],
         Instruction::Publish {
             epoch: 2,
-            active: BTreeSet::new(),
+            active: active.clone(),
         },
     );
-
     assert_eq!(
         plan.output().effects,
-        vec![ShardEffect::new(&meta(ORACLE_ACCOUNT_ID, true), &effect)]
+        vec![
+            ShardEffect::new(&meta(ORACLE_ACCOUNT_ID, true), &effect),
+            ShardEffect::new(&publication(2), &archive),
+        ]
     );
 
     let post = crate::apply(
         effect,
         &registry_data(Registry {
-            nodes: BTreeSet::from([a]),
+            registered_nodes: BTreeSet::from([a]),
             epoch: 1,
-            active: BTreeSet::from([a]),
+            active_nodes: BTreeSet::new(),
         }),
     )
     .expect("Publish writes the registry");
-
     assert_eq!(
         State::decode(&post),
         Some(State::Registry(Registry {
-            nodes: BTreeSet::from([a]),
+            registered_nodes: BTreeSet::from([a]),
             epoch: 2,
-            ..Registry::default()
+            active_nodes: active.clone(),
         }))
+    );
+    assert_eq!(
+        crate::apply(archive, &ShardData::empty()),
+        Some(published(2, &active))
     );
 }
 
@@ -121,13 +164,54 @@ fn publish_replaces_the_epoch_and_the_active_set() {
 #[should_panic(expected = "oracle authorization is missing")]
 fn publish_rejects_an_unsigned_registry() {
     let _plan = plan_for(
-        vec![meta(ORACLE_ACCOUNT_ID, false)],
+        vec![meta(ORACLE_ACCOUNT_ID, false), publication(1)],
         Instruction::Publish {
             epoch: 1,
             active: BTreeSet::new(),
         },
     );
 }
+
+#[test]
+#[should_panic(expected = "account must be the epoch's publication account")]
+fn publish_archives_into_the_epochs_own_account() {
+    let _plan = plan_for(
+        vec![meta(ORACLE_ACCOUNT_ID, true), publication(2)],
+        Instruction::Publish {
+            epoch: 1,
+            active: BTreeSet::new(),
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "a publication must advance the epoch")]
+fn a_publication_must_advance_the_epoch() {
+    let _written = crate::apply(
+        Effect::Publish {
+            epoch: 2,
+            active: BTreeSet::new(),
+        },
+        &registry_data(Registry {
+            epoch: 2,
+            ..Registry::default()
+        }),
+    );
+}
+
+#[test]
+#[should_panic(expected = "account already holds referral state")]
+fn an_epoch_is_published_once() {
+    let _written = crate::apply(
+        Effect::Create(State::Publication {
+            epoch: 2,
+            active_digest: [1; 32],
+        }),
+        &published(2, &BTreeSet::new()),
+    );
+}
+
+// === Register ===
 
 #[test]
 fn a_referred_register_announces_the_child_to_its_referrer() {
@@ -149,6 +233,7 @@ fn a_referred_register_announces_the_child_to_its_referrer() {
             referrer: Some(referrer(parent)),
             node_signature: signature(&node_key, node_id, participant_account, Some(parent)),
             pool: pool.clone(),
+            epoch: 3,
         },
     );
 
@@ -167,6 +252,7 @@ fn a_referred_register_announces_the_child_to_its_referrer() {
                 &Effect::Register {
                     node: node_id,
                     pool,
+                    epoch: 3,
                 },
             ),
             ShardEffect::new(
@@ -174,6 +260,7 @@ fn a_referred_register_announces_the_child_to_its_referrer() {
                 &Effect::Create(State::Child {
                     node: node_id,
                     referrer: parent,
+                    since: 3,
                 }),
             ),
         ]
@@ -198,6 +285,7 @@ fn a_referred_register_requires_a_child_note_account() {
             referrer: Some(referrer(parent)),
             node_signature: [0; 64],
             pool: BTreeSet::new(),
+            epoch: 0,
         },
     );
 }
@@ -216,6 +304,7 @@ fn register_rejects_a_signature_addressed_to_another_participant() {
             referrer: None,
             node_signature: signature(&node_key, node_id, signed_for, None),
             pool: BTreeSet::new(),
+            epoch: 0,
         },
     );
 }
@@ -240,6 +329,7 @@ fn register_requires_the_referrer_in_its_pool() {
             referrer: Some(referrer(parent)),
             node_signature: signature(&node_key, node_id, participant_account, Some(parent)),
             pool: BTreeSet::from([other]),
+            epoch: 0,
         },
     );
 }
@@ -253,6 +343,7 @@ fn register_checks_the_pool_before_inserting_its_node() {
         Effect::Register {
             node: node_id,
             pool: BTreeSet::from([node_id]),
+            epoch: 0,
         },
         &registry_data(Registry::default()),
     );
@@ -267,9 +358,28 @@ fn register_rejects_an_already_registered_node() {
         Effect::Register {
             node: node_id,
             pool: BTreeSet::new(),
+            epoch: 0,
         },
         &registry_data(Registry {
-            nodes: BTreeSet::from([node_id]),
+            registered_nodes: BTreeSet::from([node_id]),
+            ..Registry::default()
+        }),
+    );
+}
+
+#[test]
+#[should_panic(expected = "the registry has moved to another epoch")]
+fn register_records_only_the_current_epoch() {
+    let (_, node_id) = node(1);
+
+    let _written = crate::apply(
+        Effect::Register {
+            node: node_id,
+            pool: BTreeSet::new(),
+            epoch: 1,
+        },
+        &registry_data(Registry {
+            epoch: 2,
             ..Registry::default()
         }),
     );
@@ -285,10 +395,13 @@ fn create_rejects_an_account_that_holds_referral_state() {
         &State::Child {
             node: node_id,
             referrer: node_id,
+            since: 0,
         }
         .to_data(),
     );
 }
+
+// === Claim ===
 
 #[test]
 fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
@@ -304,6 +417,7 @@ fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
     let child = State::Child {
         node: c,
         referrer: me,
+        since: 0,
     };
     let credit = State::Credit {
         recipient_node: me,
@@ -315,32 +429,32 @@ fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
         epoch: 2,
         active_digest: digest,
     };
-
     let claim = Claim {
-        epoch: 2,
-        active: active.clone(),
-        notes: vec![child.clone(), credit.clone()],
-        total: 5,
+        epochs: vec![epoch_claim(
+            2,
+            &active,
+            vec![child.clone(), credit.clone()],
+            5,
+        )],
         referrer: Some(parent),
     };
 
     let plan = plan_for(
         vec![
             meta(participant_account, true),
-            meta(ORACLE_ACCOUNT_ID, false),
+            publication(2),
             meta(child_note, false),
             meta(credit_note, false),
             meta(outgoing, false),
         ],
         Instruction::Claim(claim.clone()),
     );
-
     assert_eq!(
         plan.output().effects,
         vec![
-            ShardEffect::new(&meta(ORACLE_ACCOUNT_ID, false), &check_epoch),
-            ShardEffect::new(&meta(child_note, false), &Effect::Consume(child.clone()),),
-            ShardEffect::new(&meta(credit_note, false), &Effect::Consume(credit.clone()),),
+            ShardEffect::new(&publication(2), &check_epoch),
+            ShardEffect::new(&meta(child_note, false), &Effect::Consume(child.clone())),
+            ShardEffect::new(&meta(credit_note, false), &Effect::Consume(credit.clone())),
             ShardEffect::new(
                 &meta(outgoing, false),
                 &Effect::Create(State::Credit {
@@ -357,17 +471,7 @@ fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
         ]
     );
 
-    assert_eq!(
-        crate::apply(
-            check_epoch,
-            &registry_data(Registry {
-                epoch: 2,
-                active,
-                ..Registry::default()
-            }),
-        ),
-        None
-    );
+    assert_eq!(crate::apply(check_epoch, &published(2, &active)), None);
     assert_eq!(
         crate::apply(Effect::Consume(child.clone()), &child.to_data()),
         Some(ShardData::empty())
@@ -385,10 +489,92 @@ fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
     assert_eq!(
         State::decode(&written),
         Some(State::Participant(Participant {
-            node: me,
-            referrer: Some(referrer(parent)),
-            children: BTreeMap::from([(c, 2)]),
+            children: BTreeMap::from([(c, vec![(2, 2)])]),
             reward_balance: 5,
+            ..Participant::new(me, Some(referrer(parent)))
+        }))
+    );
+}
+
+#[test]
+fn a_multi_epoch_claim_settles_its_epochs_in_order_and_forwards_per_epoch() {
+    let (_, me) = node(1);
+    let (_, parent) = node(2);
+    let (_, c) = node(3);
+    let participant_account = account(20);
+    let child_note = account(41);
+    let outgoing = account(43);
+    // The referrer is active in epoch 2 only, so only epoch 2's total is forwarded.
+    let second = BTreeSet::from([c, me, parent]);
+    let third = BTreeSet::from([c, me]);
+    let child = State::Child {
+        node: c,
+        referrer: me,
+        since: 0,
+    };
+    let claim = Claim {
+        epochs: vec![
+            epoch_claim(2, &second, vec![child.clone()], 1),
+            epoch_claim(3, &third, vec![], 1),
+        ],
+        referrer: Some(parent),
+    };
+
+    let plan = plan_for(
+        vec![
+            meta(participant_account, true),
+            publication(2),
+            meta(child_note, false),
+            meta(outgoing, false),
+            publication(3),
+        ],
+        Instruction::Claim(claim.clone()),
+    );
+    assert_eq!(
+        plan.output().effects,
+        vec![
+            ShardEffect::new(
+                &publication(2),
+                &Effect::CheckEpoch {
+                    epoch: 2,
+                    active_digest: active_digest(&second),
+                },
+            ),
+            ShardEffect::new(&meta(child_note, false), &Effect::Consume(child)),
+            ShardEffect::new(
+                &meta(outgoing, false),
+                &Effect::Create(State::Credit {
+                    recipient_node: parent,
+                    amount: 1,
+                    epoch: 2,
+                    active_digest: active_digest(&second),
+                }),
+            ),
+            ShardEffect::new(
+                &publication(3),
+                &Effect::CheckEpoch {
+                    epoch: 3,
+                    active_digest: active_digest(&third),
+                },
+            ),
+            ShardEffect::new(
+                &meta(participant_account, true),
+                &Effect::Claim(claim.clone()),
+            ),
+        ]
+    );
+
+    let written = crate::apply(
+        Effect::Claim(claim),
+        &State::Participant(Participant::new(me, Some(referrer(parent)))).to_data(),
+    )
+    .expect("Claim writes the participant");
+    assert_eq!(
+        State::decode(&written),
+        Some(State::Participant(Participant {
+            children: BTreeMap::from([(c, vec![(2, 3)])]),
+            reward_balance: 2,
+            ..Participant::new(me, Some(referrer(parent)))
         }))
     );
 }
@@ -396,44 +582,66 @@ fn a_claim_adopts_announced_children_and_forwards_what_it_earns() {
 #[test]
 #[should_panic(expected = "participant authorization is missing")]
 fn an_unauthorized_participant_cannot_claim() {
-    let participant_account = account(20);
-
     let _plan = plan_for(
-        vec![
-            meta(participant_account, false),
-            meta(ORACLE_ACCOUNT_ID, false),
-        ],
-        Instruction::Claim(claim(1, None)),
+        vec![meta(account(20), false), publication(1)],
+        Instruction::Claim(claim(1, &[], None)),
     );
 }
 
 #[test]
-#[should_panic(expected = "account must be the registry")]
-fn claim_rejects_an_account_that_is_not_the_registry() {
-    let participant_account = account(20);
-    let not_registry = account(21);
-
+#[should_panic(expected = "account must be the epoch's publication account")]
+fn claim_rejects_an_account_that_is_not_the_epochs_publication() {
     let _plan = plan_for(
-        vec![meta(participant_account, true), meta(not_registry, false)],
-        Instruction::Claim(claim(1, None)),
+        vec![meta(account(20), true), meta(ORACLE_ACCOUNT_ID, false)],
+        Instruction::Claim(claim(1, &[], None)),
     );
 }
 
 #[test]
-#[should_panic(expected = "a forwarding Claim ends with its outgoing credit account")]
+#[should_panic(expected = "a Claim names at least one epoch")]
+fn a_claim_names_at_least_one_epoch() {
+    let _plan = plan_for(
+        vec![meta(account(20), true)],
+        Instruction::Claim(Claim {
+            epochs: vec![],
+            referrer: None,
+        }),
+    );
+}
+
+#[test]
+#[should_panic(expected = "a Claim's epochs must strictly increase")]
+fn a_claims_epochs_must_strictly_increase() {
+    let none = BTreeSet::new();
+    let _plan = plan_for(
+        vec![meta(account(20), true), publication(3), publication(2)],
+        Instruction::Claim(Claim {
+            epochs: vec![
+                epoch_claim(3, &none, vec![], 1),
+                epoch_claim(2, &none, vec![], 1),
+            ],
+            referrer: None,
+        }),
+    );
+}
+
+#[test]
+#[should_panic(expected = "nothing to claim in epoch 1")]
+fn each_epoch_of_a_claim_must_earn_something() {
+    let _plan = plan_for(
+        vec![meta(account(20), true), publication(1)],
+        Instruction::Claim(claim(0, &[], None)),
+    );
+}
+
+#[test]
+#[should_panic(expected = "a Claim is missing the outgoing credit account")]
 fn a_referred_claim_requires_an_outgoing_credit_account() {
     let (_, parent) = node(2);
-    let participant_account = account(20);
 
     let _plan = plan_for(
-        vec![
-            meta(participant_account, true),
-            meta(ORACLE_ACCOUNT_ID, false),
-        ],
-        Instruction::Claim(Claim {
-            active: BTreeSet::from([parent]),
-            ..claim(1, Some(parent))
-        }),
+        vec![meta(account(20), true), publication(1)],
+        Instruction::Claim(claim(1, &[parent], Some(parent))),
     );
 }
 
@@ -448,29 +656,26 @@ fn a_claim_forwards_nothing_to_an_inactive_referrer() {
     let child = State::Child {
         node: c,
         referrer: me,
+        since: 0,
     };
     let claim = Claim {
-        epoch: 2,
-        active: active.clone(),
-        notes: vec![child.clone()],
-        total: 1,
+        epochs: vec![epoch_claim(2, &active, vec![child.clone()], 1)],
         referrer: Some(parent),
     };
 
     let plan = plan_for(
         vec![
             meta(participant_account, true),
-            meta(ORACLE_ACCOUNT_ID, false),
+            publication(2),
             meta(child_note, false),
         ],
         Instruction::Claim(claim.clone()),
     );
-
     assert_eq!(
         plan.output().effects,
         vec![
             ShardEffect::new(
-                &meta(ORACLE_ACCOUNT_ID, false),
+                &publication(2),
                 &Effect::CheckEpoch {
                     epoch: 2,
                     active_digest: active_digest(&active),
@@ -491,133 +696,54 @@ fn a_claim_forwards_nothing_to_an_inactive_referrer() {
     assert_eq!(
         State::decode(&written),
         Some(State::Participant(Participant {
-            node: me,
-            referrer: Some(referrer(parent)),
-            children: BTreeMap::from([(c, 2)]),
+            children: BTreeMap::from([(c, vec![(2, 2)])]),
             reward_balance: 1,
+            ..Participant::new(me, Some(referrer(parent)))
         }))
     );
 }
 
 #[test]
-#[should_panic(
-    expected = "a Claim names one account per note, then the outgoing credit account exactly when its referrer was active"
-)]
+#[should_panic(expected = "a Claim names more accounts than its epochs use")]
 fn a_claim_cannot_forward_to_an_inactive_referrer() {
     let (_, me) = node(1);
     let (_, parent) = node(2);
-    let participant_account = account(20);
 
     let _plan = plan_for(
         vec![
-            meta(participant_account, true),
-            meta(ORACLE_ACCOUNT_ID, false),
+            meta(account(20), true),
+            publication(1),
             meta(account(43), false),
         ],
-        Instruction::Claim(Claim {
-            active: BTreeSet::from([me]),
-            ..claim(1, Some(parent))
-        }),
-    );
-}
-
-#[test]
-fn a_credit_collection_forwards_under_its_earning_publication() {
-    let (_, me) = node(1);
-    let (_, parent) = node(2);
-    let (_, c) = node(3);
-    let participant_account = account(20);
-    let first_note = account(41);
-    let second_note = account(42);
-    let outgoing = account(43);
-    let active = BTreeSet::from([c, me, parent]);
-    let digest = active_digest(&active);
-    let credit = |amount| State::Credit {
-        recipient_node: me,
-        amount,
-        epoch: 2,
-        active_digest: digest,
-    };
-    let claim = Claim {
-        epoch: 2,
-        active,
-        notes: vec![credit(4), credit(3)],
-        total: 7,
-        referrer: Some(parent),
-    };
-
-    let plan = plan_for(
-        vec![
-            meta(participant_account, true),
-            meta(first_note, false),
-            meta(second_note, false),
-            meta(outgoing, false),
-        ],
-        Instruction::CollectCredits(claim.clone()),
-    );
-
-    assert_eq!(
-        plan.output().effects,
-        vec![
-            ShardEffect::new(&meta(first_note, false), &Effect::Consume(credit(4))),
-            ShardEffect::new(&meta(second_note, false), &Effect::Consume(credit(3))),
-            ShardEffect::new(
-                &meta(outgoing, false),
-                &Effect::Create(State::Credit {
-                    recipient_node: parent,
-                    amount: 7,
-                    epoch: 2,
-                    active_digest: digest,
-                }),
-            ),
-            ShardEffect::new(
-                &meta(participant_account, true),
-                &Effect::CollectCredits(claim.clone()),
-            ),
-        ]
-    );
-    let written = crate::apply(
-        Effect::CollectCredits(claim),
-        &State::Participant(Participant {
-            node: me,
-            referrer: Some(referrer(parent)),
-            children: BTreeMap::from([(c, 1)]),
-            reward_balance: 5,
-        })
-        .to_data(),
-    )
-    .expect("a credit collection writes the participant");
-    assert_eq!(
-        State::decode(&written),
-        Some(State::Participant(Participant {
-            node: me,
-            referrer: Some(referrer(parent)),
-            children: BTreeMap::from([(c, 1)]),
-            reward_balance: 12,
-        }))
+        Instruction::Claim(claim(1, &[me], Some(parent))),
     );
 }
 
 #[test]
 #[should_panic(expected = "a credit was earned in another publication")]
-fn a_credit_collection_rejects_a_fabricated_active_set() {
+fn a_claim_rejects_a_credit_from_another_publication() {
     let (_, me) = node(1);
     let (_, c) = node(3);
-    let participant_account = account(20);
-    let published = BTreeSet::from([c]);
+    let fabricated = BTreeSet::from([c, me]);
 
     let _plan = plan_for(
-        vec![meta(participant_account, true), meta(account(41), false)],
-        Instruction::CollectCredits(Claim {
-            epoch: 2,
-            active: BTreeSet::from([c, me]),
-            notes: vec![State::Credit {
-                recipient_node: me,
-                amount: 1,
-                epoch: 2,
-                active_digest: active_digest(&published),
-            }],
-            total: 1,
+        vec![
+            meta(account(20), true),
+            publication(2),
+            meta(account(41), false),
+        ],
+        Instruction::Claim(Claim {
+            epochs: vec![epoch_claim(
+                2,
+                &fabricated,
+                vec![State::Credit {
+                    recipient_node: me,
+                    amount: 1,
+                    epoch: 2,
+                    active_digest: active_digest(&BTreeSet::from([c])),
+                }],
+                1,
+            )],
             referrer: None,
         }),
     );
@@ -629,10 +755,7 @@ fn claim_rejects_a_total_that_does_not_match() {
     let (_, me) = node(1);
 
     let _written = crate::apply(
-        Effect::Claim(Claim {
-            active: BTreeSet::from([me]),
-            ..claim(1, None)
-        }),
+        Effect::Claim(claim(1, &[me], None)),
         &State::Participant(Participant::new(me, None)).to_data(),
     );
 }
@@ -644,7 +767,7 @@ fn claim_rejects_another_referrer() {
     let (_, other) = node(2);
 
     let _written = crate::apply(
-        Effect::Claim(claim(0, Some(other))),
+        Effect::Claim(claim(0, &[me], Some(other))),
         &State::Participant(Participant::new(me, None)).to_data(),
     );
 }
@@ -672,17 +795,14 @@ fn consume_rejects_a_note_that_differs_from_the_claim() {
 }
 
 #[test]
-#[should_panic(expected = "the registry has moved to another epoch")]
-fn check_epoch_rejects_a_moved_epoch() {
+#[should_panic(expected = "the publication is of another epoch")]
+fn check_epoch_rejects_another_epochs_publication() {
     let _written = crate::apply(
         Effect::CheckEpoch {
             epoch: 1,
             active_digest: active_digest(&BTreeSet::new()),
         },
-        &registry_data(Registry {
-            epoch: 2,
-            ..Registry::default()
-        }),
+        &published(2, &BTreeSet::new()),
     );
 }
 
@@ -696,12 +816,23 @@ fn check_epoch_rejects_another_active_set() {
             epoch: 2,
             active_digest: active_digest(&BTreeSet::from([a])),
         },
-        &registry_data(Registry {
-            epoch: 2,
-            ..Registry::default()
-        }),
+        &published(2, &BTreeSet::new()),
     );
 }
+
+#[test]
+#[should_panic(expected = "account holds a decodable referral state")]
+fn check_epoch_rejects_an_unpublished_epoch() {
+    let _written = crate::apply(
+        Effect::CheckEpoch {
+            epoch: 2,
+            active_digest: active_digest(&BTreeSet::new()),
+        },
+        &ShardData::empty(),
+    );
+}
+
+// === CashOut ===
 
 fn cash_out(node: NodeId, points: u128) -> Instruction {
     Instruction::CashOut {
@@ -750,10 +881,9 @@ fn a_cash_out_burns_the_full_balance_into_its_receipt() {
     );
 
     let earned = Participant {
-        node: me,
-        referrer: Some(referrer(parent)),
-        children: BTreeMap::from([(c, 2)]),
+        children: BTreeMap::from([(c, vec![(2, 2)])]),
         reward_balance: 7,
+        ..Participant::new(me, Some(referrer(parent)))
     };
     let burned = crate::apply(
         Effect::CashOutBurn {

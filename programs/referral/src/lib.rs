@@ -5,7 +5,7 @@ use lee_core::{
 pub use referral_core as core;
 use referral_core::{
     Claim, Effect, Instruction, ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1, Points,
-    Registry, State, active_digest, cash_out_receipt,
+    Registry, State, active_digest, cash_out_receipt, epoch_account,
 };
 
 pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
@@ -17,18 +17,28 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
     let mut plan = Plan::new(input);
     match instruction {
         Instruction::Publish { epoch, active } => {
-            let [registry] = input.accounts.as_slice() else {
-                panic!("Publish requires the registry")
+            let [registry, publication] = input.accounts.as_slice() else {
+                panic!("Publish requires the registry and the epoch's publication account")
             };
             assert!(registry.is_authorized, "oracle authorization is missing");
             assert_registry(registry);
+            assert_publication(input, publication, epoch);
+            let digest = active_digest(&active);
             plan.effect(registry, &Effect::Publish { epoch, active });
+            plan.effect(
+                publication,
+                &Effect::Create(State::Publication {
+                    epoch,
+                    active_digest: digest,
+                }),
+            );
         }
         Instruction::Register {
             node,
             referrer,
             node_signature,
             pool,
+            epoch,
         } => {
             let (participant, registry, child) = match input.accounts.as_slice() {
                 [participant, registry] => (participant, registry, None),
@@ -59,50 +69,30 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                 "node authorization signature is invalid"
             );
 
+            // The registry confirms the epoch is current, so the child note records the epoch the
+            // participant registered in.
             plan.effect(
                 participant,
                 &Effect::Create(State::Participant(Participant::new(node, referrer))),
             );
-            plan.effect(registry, &Effect::Register { node, pool });
+            plan.effect(registry, &Effect::Register { node, pool, epoch });
             if let Some((parent, child)) = parent.zip(child) {
                 plan.effect(
                     child,
                     &Effect::Create(State::Child {
                         node,
                         referrer: parent,
+                        since: epoch,
                     }),
                 );
             }
         }
         Instruction::Claim(claim) => {
-            let [participant, registry, rest @ ..] = input.accounts.as_slice() else {
-                panic!("Claim requires the participant and the registry")
-            };
-            assert_authorized(participant);
-            assert_registry(registry);
-            let digest = active_digest(&claim.active);
-            plan.effect(
-                registry,
-                &Effect::CheckEpoch {
-                    epoch: claim.epoch,
-                    active_digest: digest,
-                },
-            );
-            plan_claim(&mut plan, participant, rest, digest, claim, Effect::Claim);
-        }
-        Instruction::CollectCredits(claim) => {
             let [participant, rest @ ..] = input.accounts.as_slice() else {
-                panic!("CollectCredits requires the participant")
+                panic!("Claim requires the participant")
             };
             assert_authorized(participant);
-            plan_claim(
-                &mut plan,
-                participant,
-                rest,
-                active_digest(&claim.active),
-                claim,
-                Effect::CollectCredits,
-            );
+            plan_claim(&mut plan, input, participant, rest, claim);
         }
         Instruction::CashOut {
             node,
@@ -127,58 +117,82 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
     plan
 }
 
+/// Plans a claim's epochs in order. After the participant, the accounts are, for each epoch: its
+/// publication account, one account per note, then the outgoing credit account exactly when the
+/// referrer was active in that epoch.
 fn plan_claim(
     plan: &mut Plan,
+    input: &PlanInput,
     participant: &AccountMeta,
     rest: &[AccountMeta],
-    digest: [u8; 32],
     claim: Claim,
-    effect: fn(Claim) -> Effect,
 ) {
-    assert!(claim.total > 0, "nothing to claim");
-    let forward_to = claim.forward_to();
-    let (notes, outgoing) = match forward_to {
-        Some(_) => {
-            let (outgoing, notes) = rest
-                .split_last()
-                .expect("a forwarding Claim ends with its outgoing credit account");
-            (notes, Some(outgoing))
-        }
-        None => (rest, None),
-    };
-    assert_eq!(
-        notes.len(),
-        claim.notes.len(),
-        "a Claim names one account per note, then the outgoing credit account exactly when its referrer was active"
+    assert!(!claim.epochs.is_empty(), "a Claim names at least one epoch");
+    assert!(
+        claim
+            .epochs
+            .windows(2)
+            .all(|pair| matches!(pair, [earlier, later] if earlier.epoch < later.epoch)),
+        "a Claim's epochs must strictly increase"
     );
 
-    for (note, account) in claim.notes.iter().zip(notes) {
-        if let State::Credit {
-            epoch,
-            active_digest: earned_under,
-            ..
-        } = *note
-        {
-            assert_eq!(
-                (epoch, earned_under),
-                (claim.epoch, digest),
-                "a credit was earned in another publication"
+    let mut accounts = rest.iter();
+    let mut next = |what: &str| {
+        accounts
+            .next()
+            .unwrap_or_else(|| panic!("a Claim is missing {what}"))
+    };
+    for epoch_claim in &claim.epochs {
+        assert!(
+            epoch_claim.total > 0,
+            "nothing to claim in epoch {}",
+            epoch_claim.epoch
+        );
+        let digest = active_digest(&epoch_claim.active);
+
+        let publication = next("an epoch's publication account");
+        assert_publication(input, publication, epoch_claim.epoch);
+        plan.effect(
+            publication,
+            &Effect::CheckEpoch {
+                epoch: epoch_claim.epoch,
+                active_digest: digest,
+            },
+        );
+
+        for note in &epoch_claim.notes {
+            if let State::Credit {
+                epoch,
+                active_digest: earned_under,
+                ..
+            } = *note
+            {
+                assert_eq!(
+                    (epoch, earned_under),
+                    (epoch_claim.epoch, digest),
+                    "a credit was earned in another publication"
+                );
+            }
+            plan.effect(next("a note account"), &Effect::Consume(note.clone()));
+        }
+
+        if let Some(parent) = epoch_claim.forward_to(claim.referrer) {
+            plan.effect(
+                next("the outgoing credit account of an epoch its referrer was active in"),
+                &Effect::Create(State::Credit {
+                    recipient_node: parent,
+                    amount: epoch_claim.total,
+                    epoch: epoch_claim.epoch,
+                    active_digest: digest,
+                }),
             );
         }
-        plan.effect(account, &Effect::Consume(note.clone()));
     }
-    if let Some((parent, credit)) = forward_to.zip(outgoing) {
-        plan.effect(
-            credit,
-            &Effect::Create(State::Credit {
-                recipient_node: parent,
-                amount: claim.total,
-                epoch: claim.epoch,
-                active_digest: digest,
-            }),
-        );
-    }
-    plan.effect(participant, &effect(claim));
+    assert!(
+        accounts.next().is_none(),
+        "a Claim names more accounts than its epochs use"
+    );
+    plan.effect(participant, &Effect::Claim(claim));
 }
 
 #[must_use]
@@ -186,31 +200,44 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
     match effect {
         Effect::Publish { epoch, active } => {
             let mut registry = decode_registry(pre_data);
+            assert!(
+                epoch > registry.epoch,
+                "a publication must advance the epoch"
+            );
             registry.epoch = epoch;
-            registry.active = active;
+            registry.active_nodes = active;
             Some(State::Registry(registry).to_data())
         }
-        Effect::Register { node, pool } => {
+        Effect::Register { node, pool, epoch } => {
             let mut registry = decode_registry(pre_data);
+            assert_eq!(
+                registry.epoch, epoch,
+                "the registry has moved to another epoch"
+            );
             assert!(
-                pool.is_subset(&registry.nodes),
+                pool.is_subset(&registry.registered_nodes),
                 "the pool names an unregistered node"
             );
-            assert!(registry.nodes.insert(node), "node is already registered");
+            assert!(
+                registry.registered_nodes.insert(node),
+                "node is already registered"
+            );
             Some(State::Registry(registry).to_data())
         }
         Effect::CheckEpoch {
             epoch,
             active_digest: digest,
         } => {
-            let registry = decode_registry(pre_data);
+            let State::Publication {
+                epoch: published,
+                active_digest: published_digest,
+            } = decode(pre_data)
+            else {
+                panic!("the epoch account does not hold a publication")
+            };
+            assert_eq!(published, epoch, "the publication is of another epoch");
             assert_eq!(
-                registry.epoch, epoch,
-                "the registry has moved to another epoch"
-            );
-            assert_eq!(
-                active_digest(&registry.active),
-                digest,
+                published_digest, digest,
                 "the claim names another active set"
             );
             None
@@ -219,12 +246,19 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
             assert!(pre_data.is_empty(), "account already holds referral state");
             Some(state.to_data())
         }
-        Effect::Claim(claim) => Some(settle(pre_data, &claim, |participant| {
-            participant.claim(claim.epoch, &claim.active, &claim.notes)
-        })),
-        Effect::CollectCredits(claim) => Some(settle(pre_data, &claim, |participant| {
-            participant.collect_credits(&claim.active, &claim.notes)
-        })),
+        Effect::Claim(claim) => {
+            let mut participant = decode_participant(pre_data);
+            assert_eq!(
+                participant.referrer_node(),
+                claim.referrer,
+                "the claim names another referrer"
+            );
+            for epoch_claim in &claim.epochs {
+                let earned: Points = participant.claim(epoch_claim);
+                assert_eq!(earned, epoch_claim.total, "the claim total does not match");
+            }
+            Some(State::Participant(participant).to_data())
+        }
         Effect::Consume(note) => {
             assert_eq!(
                 decode(pre_data),
@@ -244,25 +278,6 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
             Some(State::Participant(participant).to_data())
         }
     }
-}
-
-fn settle(
-    pre_data: &ShardData,
-    claim: &Claim,
-    transition: impl FnOnce(&mut Participant) -> Points,
-) -> ShardData {
-    let mut participant = decode_participant(pre_data);
-    assert_eq!(
-        participant.referrer_node(),
-        claim.referrer,
-        "the claim names another referrer"
-    );
-    assert_eq!(
-        transition(&mut participant),
-        claim.total,
-        "the claim total does not match"
-    );
-    State::Participant(participant).to_data()
 }
 
 fn decode(pre_data: &ShardData) -> State {
@@ -297,6 +312,14 @@ fn assert_registry(registry: &AccountMeta) {
     assert_eq!(
         registry.account_id, ORACLE_ACCOUNT_ID,
         "account must be the registry"
+    );
+}
+
+fn assert_publication(input: &PlanInput, publication: &AccountMeta, epoch: referral_core::Epoch) {
+    assert_eq!(
+        publication.account_id,
+        epoch_account(input.self_account_id, epoch),
+        "account must be the epoch's publication account"
     );
 }
 
