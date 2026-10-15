@@ -1,0 +1,5 @@
+# Kept in step with the pinned Logos Execution Zone release.
+
+[toolchain]
+channel = "1.98.1"
+profile = "default"

@@ -1,0 +1,30 @@
+[package]
+name = "uplink_wallet"
+version = "0.1.0"
+edition = "2024"
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+common.workspace = true
+indexer_service_protocol.workspace = true
+indexer_service_rpc = { workspace = true, features = ["client"] }
+lee.workspace = true
+lee_core = { workspace = true, features = ["host"] }
+referral_core.workspace = true
+wallet.workspace = true
+
+anyhow.workspace = true
+borsh.workspace = true
+hex.workspace = true
+jsonrpsee = { workspace = true, features = ["http-client"] }
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url = { version = "2.5.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "uplink_integration_tests"
+version = "0.1.0"
+edition = "2024"
+license = { workspace = true }
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+integration_tests.workspace = true
+key_protocol.workspace = true
+lee.workspace = true
+program_loader_core.workspace = true
+referral_core.workspace = true
+referral_methods.workspace = true
+testnet_initial_state.workspace = true
+uplink_wallet.workspace = true
+wallet.workspace = true
+
+anyhow.workspace = true
+common.workspace = true
+tokio.workspace = true
