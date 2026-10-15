@@ -507,23 +507,43 @@ impl<'wallet> Referral<'wallet> {
         })
     }
 
+    /// Publishes `epoch`'s active nodes, signed by the oracle account, and remembers the
+    /// publication so claims in this wallet need not read it back from the indexer.
+    ///
+    /// A publication remembered for a transaction that is never included is harmless: claims use
+    /// a remembered active set only if it hashes to the epoch's archived digest.
     pub async fn publish(
-        &self,
+        &mut self,
         epoch: Epoch,
         active: BTreeSet<NodeId>,
     ) -> Result<HashType, ExecutionFailureKind> {
         let uplink_account = self.uplink_account();
-        self.wallet
+        let hash = self
+            .wallet
             .send_pub_tx(
                 vec![
                     AccountIdentity::Public(ORACLE_ACCOUNT_ID).select_program_shard(uplink_account),
                     AccountIdentity::PublicNoSign(epoch_account(uplink_account, epoch))
                         .select_program_shard(uplink_account),
                 ],
-                instruction_data(Instruction::Publish { epoch, active }),
+                instruction_data(Instruction::Publish {
+                    epoch,
+                    active: active.clone(),
+                }),
                 uplink_account,
             )
-            .await
+            .await?;
+        let publication = Publication {
+            uplink_account,
+            epoch,
+            active,
+        };
+        self.persisted(|store| {
+            if !store.publications.contains(&publication) {
+                store.publications.push(publication);
+            }
+        })?;
+        Ok(hash)
     }
 
     /// The opening of the participant's `index`-th receipt, under its node's `receipt_secret`.
@@ -1412,7 +1432,7 @@ mod tests {
         let ours = AccountId::new([1; 32]);
         let other = AccountId::new([2; 32]);
         let first = BTreeSet::from([NodeId::new([7; 32])]);
-        let corrected = BTreeSet::from([NodeId::new([8; 32])]);
+        let second = BTreeSet::from([NodeId::new([8; 32])]);
         let history = [
             indexed_call(
                 ours,
@@ -1446,8 +1466,8 @@ mod tests {
             indexed_effect(
                 ours,
                 &Effect::Publish {
-                    epoch: 1,
-                    active: corrected.clone(),
+                    epoch: 2,
+                    active: second.clone(),
                 },
             ),
         ];
@@ -1465,10 +1485,11 @@ mod tests {
             Some(&first)
         );
         assert_eq!(
-            store.publication(ours, 1, active_digest(&corrected)),
-            Some(&corrected)
+            store.publication(ours, 2, active_digest(&second)),
+            Some(&second)
         );
         assert_eq!(store.publication(ours, 2, active_digest(&first)), None);
+        assert_eq!(store.publication(ours, 3, active_digest(&second)), None);
         assert_eq!(
             store.publication(other, 1, active_digest(&BTreeSet::new())),
             None

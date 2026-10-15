@@ -3,7 +3,7 @@
     reason = "We don't care about these in tests"
 )]
 
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use anyhow::Result;
 use common::transaction::LeeTransaction;
@@ -12,11 +12,12 @@ use integration_tests::{
     utils::{new_account, send, sync_private, wait_for_indexer_to_catch_up},
 };
 use key_protocol::key_management::secret_holders::SeedHolder;
-use lee::{AccountId, PrivateKey};
+use lee::{AccountId, PrivateKey, ProgramShardSelector};
 use program_loader_core::MAX_SEGMENT_DATA_LEN;
 use referral_core::{
     Invitation, NodeId, ORACLE_ACCOUNT_ID, State, active_digest, cash_out_receipt,
     ed25519_dalek::{Signer as _, SigningKey},
+    epoch_account,
 };
 use referral_methods::referral;
 use testnet_initial_state::{PublicAccountPrivateInitialData, initial_pub_accounts_private_keys};
@@ -212,8 +213,6 @@ async fn publish(
         .publish(epoch, active.iter().copied().collect())
         .await?;
     ctx.wallet().poll_transaction(hash).await?;
-    // Claims read past epochs' active sets back from the indexer.
-    wait_for_indexer_to_catch_up(ctx).await?;
     Ok(())
 }
 
@@ -227,6 +226,51 @@ fn note_ids(
         .into_iter()
         .map(|(id, _state)| id)
         .collect())
+}
+
+/// Submits `operation` under `reference` and waits until it settles and the wallet has synced.
+async fn submit_and_settle(
+    ctx: &mut TestContext,
+    program: AccountId,
+    reference: [u8; 32],
+    operation: OperationKind,
+) -> Result<()> {
+    let (hash, _broadcast) = facade(ctx, program).submit(reference, operation).await?;
+    ctx.wallet().poll_transaction(hash).await?;
+    settle(ctx, program, reference).await?;
+    sync_private(ctx).await
+}
+
+/// Waits until `count` more blocks have been produced.
+async fn wait_blocks(ctx: &TestContext, count: u64) -> Result<()> {
+    let target = ctx
+        .wallet()
+        .get_last_block_id()
+        .await?
+        .saturating_add(count);
+    while ctx.wallet().get_last_block_id().await? < target {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok(())
+}
+
+/// The digest archived for `epoch`, if it was published.
+async fn archived_digest(
+    ctx: &TestContext,
+    program: AccountId,
+    epoch: u32,
+) -> Result<Option<[u8; 32]>> {
+    let account = ctx
+        .wallet()
+        .get_account_view(ProgramShardSelector::new(
+            epoch_account(program, epoch),
+            program,
+        ))
+        .await?;
+    Ok(match State::decode(account.data.shard(program)) {
+        Some(State::Publication { active_digest, .. }) => Some(active_digest),
+        _ => None,
+    })
 }
 
 fn reward_balance(
@@ -423,6 +467,9 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
     // Publications never change, so a claim for epoch 3 stays valid after epoch 4 is published;
     // building it now reads epoch 3's active set back from the indexer.
     publish(&mut ctx, program, 4, &[bob_node]).await?;
+    // A wallet that did not publish epoch 3 itself reads its active set back from the indexer.
+    forget_referral_store(&ctx)?;
+    wait_for_indexer_to_catch_up(&ctx).await?;
     let (hash, _broadcast) = facade(&mut ctx, program)
         .submit([10; 32], carol_late)
         .await?;
@@ -707,6 +754,9 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
     );
     import_oracle(&mut ctx)?;
     publish(&mut ctx, program, 3, &[bob_node, alice_node, carol_node]).await?;
+    // The restored wallet lost the publications it had seen, so Alice's claim reads epochs 1 and 2
+    // back from the indexer.
+    wait_for_indexer_to_catch_up(&ctx).await?;
     assert_eq!(
         claim(&mut ctx, program, alice, [7; 32]).await?,
         1,
@@ -727,6 +777,182 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
             .collect::<Vec<_>>(),
         vec![(0, sent[0]), (1, sent[1]), (2, third)],
         "the restored wallet cashes out after its last receipt"
+    );
+
+    Ok(())
+}
+
+#[test]
+async fn late_epochs_still_pay_and_each_credit_is_redeemed_once() -> Result<()> {
+    let mut ctx = TestContext::new().await?;
+    let payer = genesis_payer(&mut ctx);
+    let program = deploy_referral(&mut ctx, payer.account_id).await?;
+    fund_oracle(&mut ctx, payer.account_id).await?;
+
+    // Bob refers Alice, who refers Chris, and later Dan.
+    let (bob_key, bob_node) = node(1);
+    let (alice_key, alice_node) = node(2);
+    let (chris_key, chris_node) = node(3);
+    let (dan_key, dan_node) = node(4);
+    let bob = facade(&mut ctx, program).create_participant()?;
+    let alice = facade(&mut ctx, program).create_participant()?;
+    let chris = facade(&mut ctx, program).create_participant()?;
+    let dan = facade(&mut ctx, program).create_participant()?;
+    register(&mut ctx, program, bob, &bob_key, None, None).await?;
+    let bob_invites_alice = facade(&mut ctx, program).invitation(bob, bob_node)?;
+    register(
+        &mut ctx,
+        program,
+        alice,
+        &alice_key,
+        Some(bob_node),
+        Some(bob_invites_alice),
+    )
+    .await?;
+    let alice_invites_chris = facade(&mut ctx, program).invitation(alice, alice_node)?;
+    register(
+        &mut ctx,
+        program,
+        chris,
+        &chris_key,
+        Some(alice_node),
+        Some(alice_invites_chris),
+    )
+    .await?;
+
+    let everyone = [bob_node, alice_node, chris_node, dan_node];
+    for epoch in 1..=3 {
+        publish(&mut ctx, program, epoch, &everyone).await?;
+    }
+
+    // Alice claims epoch 3 first, out of order.
+    let latest = current_claim(&mut ctx, program, alice).await?;
+    submit_and_settle(&mut ctx, program, [1; 32], latest).await?;
+    assert_eq!(
+        reward_balance(&mut ctx, program, alice)?,
+        1,
+        "epoch 3 pays Alice for Chris"
+    );
+    assert_eq!(
+        facade(&mut ctx, program).claimable(alice).await?,
+        2,
+        "the epochs an earlier claim skipped still pay"
+    );
+    assert_eq!(
+        claim(&mut ctx, program, alice, [2; 32]).await?,
+        3,
+        "epochs 1 and 2 pay Alice for Chris once each"
+    );
+
+    // Dan registers under Alice during epoch 3, after Alice already claimed it.
+    let alice_invites_dan = facade(&mut ctx, program).invitation(alice, alice_node)?;
+    register(
+        &mut ctx,
+        program,
+        dan,
+        &dan_key,
+        Some(alice_node),
+        Some(alice_invites_dan),
+    )
+    .await?;
+    assert_eq!(
+        claim(&mut ctx, program, alice, [3; 32]).await?,
+        4,
+        "epoch 3 pays again for Dan alone, who counts only from the epoch he registered in"
+    );
+
+    // Alice forwarded one credit for each of epochs 1 and 2, and two for epoch 3.
+    let notes = facade(&mut ctx, program).notes(bob)?;
+    let third_credits: Vec<AccountId> = notes
+        .iter()
+        .filter(|(_id, note)| matches!(note, State::Credit { epoch: 3, .. }))
+        .map(|(id, _note)| *id)
+        .collect();
+    assert_eq!(
+        third_credits.len(),
+        2,
+        "two claims of epoch 3 forwarded two credits"
+    );
+    let announcement = notes
+        .iter()
+        .filter(|(_id, note)| matches!(note, State::Child { .. }))
+        .map(|(id, _note)| *id);
+
+    // Bob redeems one epoch 3 credit, then the planner settles the rest.
+    let third = facade(&mut ctx, program).registry().await?;
+    let one_credit = OperationKind::Claim {
+        participant: bob,
+        epochs: vec![ClaimedEpoch {
+            epoch: 3,
+            active_digest: active_digest(&third.active_nodes),
+            notes: announcement.chain(third_credits.first().copied()).collect(),
+        }],
+    };
+    submit_and_settle(&mut ctx, program, [4; 32], one_credit).await?;
+    assert_eq!(
+        reward_balance(&mut ctx, program, bob)?,
+        2,
+        "epoch 3 pays Bob for Alice and for the one credit redeemed"
+    );
+    assert_eq!(
+        facade(&mut ctx, program).claimable(bob).await?,
+        5,
+        "epochs 1 and 2 pay for Alice and their credits, and the second epoch 3 credit pays alone"
+    );
+    assert_eq!(
+        claim(&mut ctx, program, bob, [5; 32]).await?,
+        7,
+        "every credit is redeemed once"
+    );
+    assert_eq!(
+        facade(&mut ctx, program).claimable(bob).await?,
+        0,
+        "nothing is left to redeem"
+    );
+
+    Ok(())
+}
+
+#[test]
+async fn publications_only_advance_and_never_change() -> Result<()> {
+    let mut ctx = TestContext::new().await?;
+    let payer = genesis_payer(&mut ctx);
+    let program = deploy_referral(&mut ctx, payer.account_id).await?;
+    fund_oracle(&mut ctx, payer.account_id).await?;
+    let (_, first) = node(1);
+    let (_, second) = node(2);
+
+    publish(&mut ctx, program, 1, &[first]).await?;
+    publish(&mut ctx, program, 2, &[first]).await?;
+    let archived = archived_digest(&ctx, program, 2).await?;
+    assert_eq!(
+        archived,
+        Some(active_digest(&BTreeSet::from([first]))),
+        "a publication archives its active set's digest"
+    );
+
+    // Republishing epoch 2 and publishing an earlier epoch are both refused. Whether the sequencer
+    // turns them away at submission or they fail at inclusion, nothing changes.
+    let _repeated = facade(&mut ctx, program)
+        .publish(2, BTreeSet::from([second]))
+        .await;
+    let _earlier = facade(&mut ctx, program)
+        .publish(1, BTreeSet::from([second]))
+        .await;
+    // Let any refused attempt leave the mempool before the oracle publishes again.
+    wait_blocks(&ctx, 3).await?;
+    publish(&mut ctx, program, 3, &[second]).await?;
+
+    assert_eq!(
+        archived_digest(&ctx, program, 2).await?,
+        archived,
+        "an epoch's archived publication never changes"
+    );
+    let registry = facade(&mut ctx, program).registry().await?;
+    assert_eq!(
+        (registry.epoch, registry.active_nodes),
+        (3, BTreeSet::from([second])),
+        "the registry holds only the publications that advanced it"
     );
 
     Ok(())

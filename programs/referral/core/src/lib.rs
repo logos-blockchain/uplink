@@ -789,7 +789,14 @@ mod tests {
 
     #[test]
     fn the_epoch_account_is_the_program_pda_of_the_prefixed_epoch() {
-        assert_eq!(epoch_account(PROGRAM, 1), epoch_account(PROGRAM, 1));
+        assert_eq!(
+            epoch_account(PROGRAM, 1),
+            AccountId::new([
+                0xc9, 0x62, 0x08, 0x99, 0xc1, 0xb7, 0x6d, 0xac, 0xd7, 0xe5, 0xc7, 0x38, 0x9a, 0x00,
+                0x10, 0xcb, 0x22, 0x8d, 0x4e, 0x36, 0x6c, 0x30, 0xc1, 0x0a, 0x90, 0xb2, 0x2a, 0xcf,
+                0x24, 0x8b, 0xef, 0xc9,
+            ])
+        );
         assert_ne!(epoch_account(PROGRAM, 2), epoch_account(PROGRAM, 1));
         assert_ne!(
             epoch_account(AccountId::new([10; 32]), 1),
