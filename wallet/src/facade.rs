@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
 };
 
@@ -395,78 +395,17 @@ impl<'wallet> Referral<'wallet> {
         let registry = self.registry().await?;
         let notes = self.notes(participant)?;
 
-        let earliest = claimant
-            .children
-            .values()
-            .map(|settled| first_unsettled(settled))
-            .chain(notes.iter().map(|(_id, state)| match *state {
-                State::Child { since, .. } => since,
-                State::Credit { epoch, .. } => epoch,
-                State::Registry(_)
-                | State::Participant(_)
-                | State::CashOut { .. }
-                | State::Publication { .. } => Epoch::MAX,
-            }))
-            .min();
-        let Some(earliest) = earliest else {
+        let Some(earliest) = earliest_claimable(&claimant, &notes) else {
             return Ok(Vec::new());
         };
-
-        // Announced children are adopted in the first epoch claimed, so simulate them adopted
-        // from the start: an epoch before the first one claimed pays nothing either way.
-        let (children, credits): (Vec<_>, Vec<_>) = notes
-            .into_iter()
-            .partition(|(_id, state)| matches!(state, State::Child { .. }));
-        let mut simulated = claimant.clone();
-        for (_id, child) in &children {
-            if let State::Child { node, since, .. } = *child {
-                simulated.adopt(node, since);
-            }
-        }
-
-        let mut planned: Vec<(ClaimedEpoch, usize, Points)> = Vec::new();
+        let mut published = BTreeMap::new();
         for epoch in earliest.max(1)..=registry.epoch {
-            let Some(active) = self.published_active(&registry, epoch).await? else {
-                continue;
-            };
-            if !active.contains(&claimant.node) {
-                continue;
+            if let Some(active) = self.published_active(&registry, epoch).await? {
+                published.insert(epoch, active);
             }
-            let digest = active_digest(&active);
-            let (ids, states): (Vec<AccountId>, Vec<State>) = credits
-                .iter()
-                .filter(|(_id, state)| {
-                    matches!(*state, State::Credit { epoch: earned, active_digest: under, .. }
-                        if (earned, under) == (epoch, digest))
-                })
-                .cloned()
-                .unzip();
-            let entries = active.len();
-            let total = simulated.claim(&EpochClaim {
-                epoch,
-                active,
-                notes: states,
-                total: 0,
-            });
-            if total > 0 {
-                planned.push((
-                    ClaimedEpoch {
-                        epoch,
-                        active_digest: digest,
-                        notes: ids,
-                    },
-                    entries,
-                    total,
-                ));
-            }
-        }
-        if let Some((first, _entries, _total)) = planned.first_mut() {
-            first
-                .notes
-                .splice(0..0, children.iter().map(|(id, _state)| *id));
         }
 
-        batch_claims(participant, planned)
+        batch_claims(participant, plan_epochs(&claimant, notes, published))
     }
 
     /// The active set of published `epoch`, checked against its publication account, or `None` if
@@ -779,7 +718,7 @@ impl<'wallet> Referral<'wallet> {
             .get_last_block_id()
             .await
             .map_err(ExecutionFailureKind::SequencerError)?;
-        Ok(last_block.saturating_sub(recorded.sent_at_block) >= RESUBMIT_AFTER_BLOCKS)
+        Ok(is_lost_at(last_block, recorded.sent_at_block))
     }
 
     /// Builds, proves and sends one attempt at `operation`, returning what to record for it.
@@ -1187,6 +1126,94 @@ fn decode_registry(
     }
 }
 
+/// The earliest epoch the participant could still earn in: each child's first unsettled epoch,
+/// each announced child's registration epoch, and each waiting credit's epoch. `None` if it has no
+/// children and no notes.
+fn earliest_claimable(claimant: &Participant, notes: &[(AccountId, State)]) -> Option<Epoch> {
+    claimant
+        .children
+        .values()
+        .map(|settled| first_unsettled(settled))
+        .chain(notes.iter().map(|(_id, state)| match *state {
+            State::Child { since, .. } => since,
+            State::Credit { epoch, .. } => epoch,
+            State::Registry(_)
+            | State::Participant(_)
+            | State::CashOut { .. }
+            | State::Publication { .. } => Epoch::MAX,
+        }))
+        .min()
+}
+
+/// Plans the participant's claims over `published` epochs, oldest first: each epoch that would pay,
+/// with the credits earned in it, its active set's size and what it pays. Announced children go
+/// with the first epoch planned.
+///
+/// Simulates the claims with the program's own [`Participant::claim`], so each total is what the
+/// program will compute.
+fn plan_epochs(
+    claimant: &Participant,
+    notes: Vec<(AccountId, State)>,
+    published: BTreeMap<Epoch, BTreeSet<NodeId>>,
+) -> Vec<(ClaimedEpoch, usize, Points)> {
+    // Announced children are adopted in the first epoch claimed, so simulate them adopted from the
+    // start: an epoch before the first one claimed pays nothing either way.
+    let (children, credits): (Vec<_>, Vec<_>) = notes
+        .into_iter()
+        .partition(|(_id, state)| matches!(state, State::Child { .. }));
+    let mut simulated = claimant.clone();
+    for (_id, child) in &children {
+        if let State::Child { node, since, .. } = *child {
+            simulated.adopt(node, since);
+        }
+    }
+
+    let mut planned: Vec<(ClaimedEpoch, usize, Points)> = Vec::new();
+    for (epoch, active) in published {
+        if !active.contains(&claimant.node) {
+            continue;
+        }
+        let digest = active_digest(&active);
+        let (ids, states): (Vec<AccountId>, Vec<State>) = credits
+            .iter()
+            .filter(|(_id, state)| {
+                matches!(*state, State::Credit { epoch: earned, active_digest: under, .. }
+                    if (earned, under) == (epoch, digest))
+            })
+            .cloned()
+            .unzip();
+        let entries = active.len();
+        let total = simulated.claim(&EpochClaim {
+            epoch,
+            active,
+            notes: states,
+            total: 0,
+        });
+        if total > 0 {
+            planned.push((
+                ClaimedEpoch {
+                    epoch,
+                    active_digest: digest,
+                    notes: ids,
+                },
+                entries,
+                total,
+            ));
+        }
+    }
+    if let Some((first, _entries, _total)) = planned.first_mut() {
+        first
+            .notes
+            .splice(0..0, children.iter().map(|(id, _state)| *id));
+    }
+    planned
+}
+
+/// Whether an attempt sent at `sent_at_block` and not yet included counts as lost at `last_block`.
+const fn is_lost_at(last_block: BlockId, sent_at_block: BlockId) -> bool {
+    last_block.saturating_sub(sent_at_block) >= RESUBMIT_AFTER_BLOCKS
+}
+
 /// The first epoch not yet settled for a child, given its settled ranges. Epoch 0 is never
 /// published, so it counts as settled.
 fn first_unsettled(settled: &[(Epoch, Epoch)]) -> Epoch {
@@ -1326,6 +1353,8 @@ fn instruction_data(instruction: Instruction) -> InstructionData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ME: NodeId = NodeId::new([5; 32]);
 
     fn indexed_id(account_id: AccountId) -> indexer_service_protocol::AccountId {
         indexer_service_protocol::AccountId {
@@ -1595,6 +1624,122 @@ mod tests {
         assert_eq!(first_unsettled(&[(0, 2)]), 3);
         assert_eq!(first_unsettled(&[(0, 2), (4, 6)]), 3);
         assert_eq!(first_unsettled(&[(2, 3)]), 1);
+    }
+
+    fn active(nodes: &[NodeId]) -> BTreeSet<NodeId> {
+        nodes.iter().copied().collect()
+    }
+
+    #[test]
+    fn the_planner_keeps_only_paying_epochs_and_adopts_announcements_in_the_first() {
+        let a = NodeId::new([1; 32]);
+        let third = active(&[ME, a]);
+        let (announcement, credit) = (AccountId::new([11; 32]), AccountId::new([12; 32]));
+        let notes = vec![
+            (
+                announcement,
+                State::Child {
+                    node: a,
+                    referrer: ME,
+                    since: 2,
+                },
+            ),
+            (
+                credit,
+                State::Credit {
+                    recipient_node: ME,
+                    amount: 5,
+                    epoch: 3,
+                    active_digest: active_digest(&third),
+                },
+            ),
+        ];
+        let published = BTreeMap::from([
+            // Before the child registered: nothing.
+            (1, active(&[ME, a])),
+            // The claimant was inactive: unclaimable.
+            (2, active(&[a])),
+            // The child and the credit.
+            (3, third.clone()),
+            // Nobody below the claimant was active.
+            (4, active(&[ME])),
+        ]);
+
+        assert_eq!(
+            plan_epochs(&Participant::new(ME, None), notes, published),
+            vec![(
+                ClaimedEpoch {
+                    epoch: 3,
+                    active_digest: active_digest(&third),
+                    notes: vec![announcement, credit],
+                },
+                2,
+                6,
+            )]
+        );
+    }
+
+    #[test]
+    fn the_planner_fills_an_epoch_an_earlier_claim_skipped() {
+        let a = NodeId::new([1; 32]);
+        // Epoch 2 was claimed before epoch 1.
+        let claimant = Participant {
+            children: BTreeMap::from([(a, vec![(0, 0), (2, 2)])]),
+            ..Participant::new(ME, None)
+        };
+        let published = (1..=3).map(|epoch| (epoch, active(&[ME, a]))).collect();
+
+        let epochs: Vec<Epoch> = plan_epochs(&claimant, Vec::new(), published)
+            .into_iter()
+            .map(|(claimed, _entries, _total)| claimed.epoch)
+            .collect();
+        assert_eq!(epochs, vec![1, 3]);
+    }
+
+    #[test]
+    fn the_earliest_claimable_epoch_is_the_oldest_unsettled_child_or_note() {
+        let claimant = Participant::new(ME, None);
+        assert_eq!(earliest_claimable(&claimant, &[]), None);
+
+        let settled = Participant {
+            children: BTreeMap::from([(NodeId::new([1; 32]), vec![(0, 4)])]),
+            ..claimant
+        };
+        assert_eq!(earliest_claimable(&settled, &[]), Some(5));
+
+        let credit = (
+            AccountId::new([11; 32]),
+            State::Credit {
+                recipient_node: ME,
+                amount: 1,
+                epoch: 3,
+                active_digest: [0; 32],
+            },
+        );
+        assert_eq!(earliest_claimable(&settled, &[credit]), Some(3));
+
+        let announcement = (
+            AccountId::new([12; 32]),
+            State::Child {
+                node: NodeId::new([2; 32]),
+                referrer: ME,
+                since: 2,
+            },
+        );
+        assert_eq!(earliest_claimable(&settled, &[announcement]), Some(2));
+    }
+
+    #[test]
+    fn an_attempt_counts_as_lost_once_the_resubmit_window_passes() {
+        let sent = 100;
+        let due = sent + RESUBMIT_AFTER_BLOCKS;
+
+        assert!(!is_lost_at(due - 1, sent));
+        assert!(is_lost_at(due, sent));
+        assert!(
+            !is_lost_at(sent - 10, sent),
+            "a height behind the attempt never counts it lost"
+        );
     }
 
     #[test]
