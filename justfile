@@ -1,4 +1,7 @@
 # Same container LEZ builds its guests with, so the referral binary is reproducible.
+# A local devnet to try the whole flow on: `just devnet` lists its recipes.
+mod devnet
+
 RISC0_DOCKER_CONTAINER_TAG := "r0.1.91.1"
 
 # Build the referral guest in Docker and commit the result under artifacts/.

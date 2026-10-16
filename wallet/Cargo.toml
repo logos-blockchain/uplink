@@ -11,6 +11,9 @@ workspace = true
 common.workspace = true
 indexer_service_protocol.workspace = true
 indexer_service_rpc = { workspace = true, features = ["client"] }
+lb-common-http-client.workspace = true
+lb-core.workspace = true
+lb-http-api-common.workspace = true
 lee.workspace = true
 lee_core = { workspace = true, features = ["host"] }
 referral_core.workspace = true

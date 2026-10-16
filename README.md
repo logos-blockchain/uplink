@@ -27,6 +27,30 @@ indexer and checks each against its archived digest, claims epochs oldest first,
 catch-up into claims of at most 16 epochs and 2,048 active-set entries, about 2,200 guest cycles
 each.
 
+## The oracle
+
+The oracle publishes the blend network's membership. `uplink oracle --node <URL>` runs alongside a
+Logos blockchain node, reads its SDP snapshot, the Blend declarations active in the current chain
+epoch, and publishes their providers as that epoch's active nodes. Each node is named by its Ed25519 provider
+key, the same key that signs its registration. Uplink epoch `e` is chain epoch `e`, so anyone can
+check a publication against the chain.
+
+An epoch is published only once the node's last irreversible block is inside it: the ledger fixes an
+epoch's snapshot when the epoch begins, so from then on no reorg can change it. The oracle checks
+the node every few seconds and publishes each epoch once; a publication that is not included is
+sent again after a minute, and the chain rejects a second publication of an epoch. An epoch the
+oracle never publishes is skipped, and claims skip it too. `--once` checks a single time and exits.
+
+```sh
+uplink --program <ID> oracle --node http://localhost:8080
+```
+
+## Devnet
+
+`devnet/` runs the whole flow locally: four blockchain nodes with no blend nodes at genesis, a LEZ
+sequencer and indexer, the oracle, recipes for each operator action, and a terminal dashboard. See
+[devnet/README.md](devnet/README.md).
+
 ## Layout
 
 | Path | Crate | What it holds |

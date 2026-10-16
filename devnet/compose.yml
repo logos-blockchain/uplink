@@ -1,0 +1,110 @@
+# The uplink devnet: four Logos blockchain nodes, a LEZ sequencer and indexer on node-0, and the
+# uplink oracle. `just devnet init` writes the configs this reads from state/; see devnet/README.md.
+
+name: uplink-devnet
+
+x-node: &node
+  image: uplink-devnet/blockchain
+  build:
+    context: .
+    dockerfile: docker/blockchain.Dockerfile
+  command: ["/config/config.yaml", "--deployment", "/config/deployment.yaml"]
+  restart: unless-stopped
+
+x-lez: &lez
+  image: uplink-devnet/lez
+  build:
+    context: .
+    dockerfile: docker/lez.Dockerfile
+  restart: unless-stopped
+
+services:
+  node-0:
+    <<: *node
+    volumes:
+      - ./state/config/node-0/config.yaml:/config/config.yaml:ro
+      - ./state/config/deployment.yaml:/config/deployment.yaml:ro
+      - ./state/data/node-0:/data
+    ports: ["18080:18080"]
+    networks: { devnet: { ipv4_address: 172.28.0.10 } }
+
+  node-1:
+    <<: *node
+    volumes:
+      - ./state/config/node-1/config.yaml:/config/config.yaml:ro
+      - ./state/config/deployment.yaml:/config/deployment.yaml:ro
+      - ./state/data/node-1:/data
+    ports: ["18081:18080"]
+    networks: { devnet: { ipv4_address: 172.28.0.11 } }
+
+  node-2:
+    <<: *node
+    volumes:
+      - ./state/config/node-2/config.yaml:/config/config.yaml:ro
+      - ./state/config/deployment.yaml:/config/deployment.yaml:ro
+      - ./state/data/node-2:/data
+    ports: ["18082:18080"]
+    networks: { devnet: { ipv4_address: 172.28.0.12 } }
+
+  node-3:
+    <<: *node
+    volumes:
+      - ./state/config/node-3/config.yaml:/config/config.yaml:ro
+      - ./state/config/deployment.yaml:/config/deployment.yaml:ro
+      - ./state/data/node-3:/data
+    ports: ["18083:18080"]
+    networks: { devnet: { ipv4_address: 172.28.0.13 } }
+
+  # Creates the LEZ channel on node-0 and posts LEZ blocks to it, paying from the funding key
+  # genesis gives every node.
+  sequencer:
+    <<: *lez
+    command: ["sequencer_service", "/config/sequencer_config.json"]
+    environment:
+      RUST_LOG: ${SEQUENCER_LOG:-info}
+    volumes:
+      - ./state/config/sequencer_config.json:/config/sequencer_config.json:ro
+      - ./state/data/sequencer:/var/lib/sequencer
+    ports: ["3040:3040"]
+    depends_on: [node-0]
+    networks: { devnet: { ipv4_address: 172.28.0.20 } }
+
+  indexer:
+    <<: *lez
+    command:
+      ["indexer_service", "/config/indexer_config.json", "--data-dir", "/var/lib/indexer"]
+    volumes:
+      - ./lez/indexer_config.json:/config/indexer_config.json:ro
+      - ./state/data/indexer:/var/lib/indexer
+    ports: ["8779:8779"]
+    depends_on: [node-0]
+    networks: { devnet: { ipv4_address: 172.28.0.21 } }
+
+  # Publishes the blend membership node-0 sees in each finalized epoch. Waits for
+  # `just devnet bootstrap` to deploy the program and set up its wallet.
+  oracle:
+    image: uplink-devnet/uplink
+    build:
+      context: ..
+      dockerfile: devnet/docker/uplink.Dockerfile
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until [ -s /state/program ] && [ -s /wallet/storage.json ]; do
+          echo "waiting for the devnet bootstrap"; sleep 5
+        done
+        exec uplink --program "$$(cat /state/program)" oracle --node http://node-0:18080
+    environment:
+      LEE_WALLET_HOME_DIR: /wallet
+    volumes:
+      - ./state:/state:ro
+      - ./state/wallets/oracle:/wallet
+    depends_on: [node-0, sequencer]
+    restart: unless-stopped
+    networks: { devnet: { ipv4_address: 172.28.0.30 } }
+
+networks:
+  devnet:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
