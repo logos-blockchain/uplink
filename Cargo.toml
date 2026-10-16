@@ -7,6 +7,8 @@ members = [
   "wallet",
   "cli",
   "integration_tests",
+  "devnet/tool",
+  "devnet/dashboard",
 ]
 
 [workspace.package]
@@ -25,6 +27,11 @@ indexer_service_protocol = { git = "https://github.com/logos-blockchain/logos-ex
 program_loader_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
 testnet_initial_state = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
 integration_tests = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
+
+# Logos blockchain node API, at the revision LEZ v0.3.1 pins.
+lb-common-http-client = { package = "logos-blockchain-common-http-client", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "3926a532b9d96d62747da064161a115a7c0c5a3e" }
+lb-core = { package = "logos-blockchain-core", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "3926a532b9d96d62747da064161a115a7c0c5a3e" }
+lb-http-api-common = { package = "logos-blockchain-http-api-common", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "3926a532b9d96d62747da064161a115a7c0c5a3e" }
 
 referral_core = { path = "programs/referral/core" }
 referral_program = { path = "programs/referral" }

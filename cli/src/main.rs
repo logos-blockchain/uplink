@@ -8,6 +8,7 @@
 //! The wallet is loaded the way the LEZ `wallet` binary loads it, and must already be set up. The
 //! referral store is kept next to the wallet's storage.
 
+use core::time::Duration;
 use std::{
     collections::BTreeSet,
     fs,
@@ -20,9 +21,11 @@ use lee::AccountId;
 use rand::RngCore as _;
 use referral_core::{Epoch, Invitation, NodeId, State};
 use referral_methods::referral;
-use uplink_wallet::{Referral, store::OperationKind};
+use uplink_wallet::{BlendNode, Referral, store::OperationKind};
 use url::Url;
 use wallet::WalletCore;
+
+mod oracle;
 
 #[derive(Parser)]
 #[command(about = "Node referral program on the Logos Execution Zone")]
@@ -149,6 +152,20 @@ enum Command {
         /// Active nodes, as hex.
         #[arg(long = "active", value_parser = parse_node)]
         active: Vec<NodeId>,
+    },
+    /// Run the oracle: publish the blend network's members in each chain epoch as that epoch's
+    /// active nodes, once the node finalizes the epoch. Signed by the oracle account, which this
+    /// wallet must hold.
+    Oracle {
+        /// HTTP endpoint of a Logos blockchain node.
+        #[arg(long, env = "UPLINK_BLEND_NODE")]
+        node: Url,
+        /// Seconds between checks of the node.
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+        /// Check once, publish if there is anything to publish, and exit.
+        #[arg(long)]
+        once: bool,
     },
 }
 
@@ -294,6 +311,19 @@ async fn run(facade: &mut Referral<'_>, command: Command) -> Result<()> {
                 .publish(epoch, active.into_iter().collect::<BTreeSet<_>>())
                 .await?;
             println!("{hash}");
+        }
+        Command::Oracle {
+            node,
+            interval,
+            once,
+        } => {
+            oracle::run(
+                facade,
+                &BlendNode::new(node),
+                Duration::from_secs(interval),
+                once,
+            )
+            .await?;
         }
     }
     Ok(())

@@ -1,0 +1,188 @@
+# The uplink devnet: four Logos blockchain nodes, a LEZ sequencer and indexer, and the oracle.
+# Run from the repository root as `just devnet <recipe>`; see devnet/README.md for the flow.
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+set quiet
+
+state := source_directory() / "state"
+compose := "docker compose -f " + source_directory() / "compose.yml"
+root := source_directory() / ".."
+self := just_executable() + " --justfile " + source_file() + " --working-directory " + source_directory()
+
+# What every `uplink` call runs with: dev-mode proofs and the devnet's indexer.
+uplink := "RISC0_DEV_MODE=1 UPLINK_INDEXER=http://127.0.0.1:8779 cargo run -q --manifest-path " + root / "Cargo.toml" + " -p uplink --"
+devnet_tool := "RISC0_DEV_MODE=1 cargo run -q --manifest-path " + root / "Cargo.toml" + " -p uplink_devnet --"
+
+default:
+    @{{self}} --list
+
+# Build the devnet's images: the node, the LEZ sequencer and indexer, and the oracle.
+build:
+    {{compose}} build
+
+# Write a fresh genesis (no blend nodes) and the node, sequencer and wallet layout under state/.
+init:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -e "{{state}}" ]; then echo "{{state}} exists; run \`just devnet reset\` first" >&2; exit 1; fi
+    mkdir -p "{{state}}/config" "{{state}}/wallets/oracle" "{{state}}/invitations"
+    for dir in node-0 node-1 node-2 node-3 sequencer indexer; do mkdir -p "{{state}}/data/$dir"; done
+    docker run --rm --entrypoint devnet_config -v "{{state}}/config:/out" uplink-devnet/blockchain --out /out
+    sed "s/__SEQUENCER_FUNDING_KEY__/$(cat "{{state}}/config/sequencer_funding_key")/" \
+        "{{source_directory()}}/lez/sequencer_config.json" > "{{state}}/config/sequencer_config.json"
+
+# Start the devnet, deploy the referral program and start the oracle. Runs `init` the first time.
+up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -e "{{state}}" ] || {{self}} init
+    {{compose}} up -d node-0 node-1 node-2 node-3 sequencer indexer
+    echo "Waiting for the sequencer to create its channel and start producing blocks"
+    {{devnet_tool}} bootstrap --state "{{state}}" \
+        | grep -v -e '^Transaction data is' -e '^Stored persistent accounts' || true
+    {{compose}} up -d oracle
+    echo "Program: $(cat "{{state}}/program")"
+
+# Stop the devnet, keeping its state.
+down:
+    {{compose}} down
+
+# Stop the devnet and delete its state: chain data, configs and wallets.
+reset:
+    {{compose}} down --remove-orphans
+    rm -rf "{{state}}"
+
+# Follow a service's logs: node-0..3, sequencer, indexer or oracle.
+logs service="oracle":
+    {{compose}} logs -f {{service}}
+
+# The services and their health.
+ps:
+    {{compose}} ps
+
+# Watch the devnet: nodes, blend membership by epoch, the uplink registry, participants and activity.
+dashboard:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Until `up` deploys the program, show only the chains.
+    program_args=()
+    [ -s "{{state}}/program" ] && program_args=(--program "$(cat "{{state}}/program")")
+    RISC0_DEV_MODE=1 cargo run -q --manifest-path "{{root}}/Cargo.toml" -p uplink_dashboard -- \
+        ${program_args[@]+"${program_args[@]}"} \
+        --labels "{{state}}/config" \
+        --wallet "node-0={{state}}/wallets/node-0" --wallet "node-1={{state}}/wallets/node-1" \
+        --wallet "node-2={{state}}/wallets/node-2" --wallet "node-3={{state}}/wallets/node-3"
+
+# ---- Blend ----
+
+# Declare node N a blend node; it joins the membership two epochs later.
+blend-join n:
+    @curl -sf -X POST "http://127.0.0.1:1808{{n}}/blend/join" -H 'content-type: application/json' \
+        -d "{\"locator\": \"$(cat "{{state}}/config/node-{{n}}/locator")\", \"service_note_id\": \"$(cat "{{state}}/config/node-{{n}}/blend_note_id")\"}"
+    @echo
+
+# Withdraw node N's blend declaration; it leaves the membership once `withdraw_at` is reached.
+blend-withdraw n:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    provider="$(cat "{{state}}/config/node-{{n}}/provider_id")"
+    declaration="$(curl -sf "http://127.0.0.1:1808{{n}}/mantle/sdp/declarations" | jq -r --arg provider "$provider" \
+        'to_entries[] | select(.value.service_type == "BN" and .value.provider_id == $provider and .value.withdraw_at == null) | .key')"
+    if [ -z "$declaration" ]; then echo "node-{{n}} has no blend declaration to withdraw" >&2; exit 1; fi
+    curl -sf -X POST "http://127.0.0.1:1808{{n}}/sdp/withdrawal" -H 'content-type: application/json' -d "\"$declaration\""
+    # The node posts the withdrawal in the background and only logs a failure.
+    echo "Posted the withdrawal of $declaration; check \`just devnet blend-status {{n}}\` for its withdraw_at, or \`just devnet logs node-{{n}}\` if it never appears"
+
+# The blend declarations and the current epoch's membership, as node N sees them.
+blend-status n="0":
+    @echo "declarations:"; curl -sf "http://127.0.0.1:1808{{n}}/mantle/sdp/declarations" | jq
+    @echo "current epoch's membership:"; curl -sf "http://127.0.0.1:1808{{n}}/mantle/sdp/snapshot" | jq
+
+# ---- The uplink flow, acting as node N's operator ----
+
+# Node N's participant account, created in its operator's wallet the first time.
+participant n:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    file="{{state}}/wallets/node-{{n}}/participant"
+    if [ ! -s "$file" ]; then
+        LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}" UPLINK_PROGRAM="$(cat "{{state}}/program")" \
+            {{uplink}} new-participant | tail -n1 > "$file"
+    fi
+    cat "$file"
+
+# Register node N, referred by node REFERRER (which must be registered) if given.
+register n referrer="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export UPLINK_PROGRAM="$(cat "{{state}}/program")"
+    config="{{state}}/config"
+    me="$({{self}} participant {{n}})"
+    referrer_args=()
+    if [ -n "{{referrer}}" ]; then
+        invitation="{{state}}/invitations/node-{{referrer}}.json"
+        LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{referrer}}" {{uplink}} invite \
+            --participant "$({{self}} participant {{referrer}})" \
+            --node "$(cat "$config/node-{{referrer}}/provider_id")" --out "$invitation"
+        LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}" {{uplink}} accept-invite \
+            --participant "$me" "$invitation"
+        referrer_args=(--referrer "$(cat "$config/node-{{referrer}}/provider_id")")
+    fi
+    export LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}"
+    message="$({{uplink}} prepare-registration --participant "$me" \
+        --node "$(cat "$config/node-{{n}}/provider_id")" ${referrer_args[@]+"${referrer_args[@]}"} | tail -n1)"
+    signature="$({{devnet_tool}} sign --key-file "$config/node-{{n}}/node.key" "$message")"
+    {{uplink}} attach-signature --participant "$me" --signature "$signature"
+    {{uplink}} register --participant "$me"
+
+# Node N's participant: its node, referrer, children and points.
+show n:
+    LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}" UPLINK_PROGRAM="$(cat "{{state}}/program")" \
+        {{uplink}} show --participant "$({{self}} participant {{n}})"
+
+# What claiming would pay node N now.
+claimable n:
+    LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}" UPLINK_PROGRAM="$(cat "{{state}}/program")" \
+        {{uplink}} claimable --participant "$({{self}} participant {{n}})"
+
+# Claim every epoch node N has not settled yet.
+claim n:
+    LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}" UPLINK_PROGRAM="$(cat "{{state}}/program")" \
+        {{uplink}} claim --participant "$({{self}} participant {{n}})"
+
+# Cash node N's whole balance out into a new public receipt only its operator can link to it.
+cash-out n:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{self}} receipt-secret {{n}} > /dev/null
+    LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}" UPLINK_PROGRAM="$(cat "{{state}}/program")" \
+        {{uplink}} cash-out --participant "$({{self}} participant {{n}})" \
+        --receipt-secret-file "{{state}}/wallets/node-{{n}}/receipt.secret"
+
+# Node N's cash-out receipts.
+receipts n:
+    {{self}} receipt-secret {{n}} > /dev/null
+    LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}" UPLINK_PROGRAM="$(cat "{{state}}/program")" \
+        {{uplink}} receipts --participant "$({{self}} participant {{n}})" \
+        --receipt-secret-file "{{state}}/wallets/node-{{n}}/receipt.secret"
+
+# The opening that links node N's receipt INDEX to its node, to be paid.
+opening n index="0":
+    {{self}} receipt-secret {{n}} > /dev/null
+    LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}" UPLINK_PROGRAM="$(cat "{{state}}/program")" \
+        {{uplink}} opening --participant "$({{self}} participant {{n}})" --index {{index}} \
+        --receipt-secret-file "{{state}}/wallets/node-{{n}}/receipt.secret"
+
+# Node N's receipt secret, derived from its node key by its operator the first time.
+[private]
+receipt-secret n:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    secret="{{state}}/wallets/node-{{n}}/receipt.secret"
+    [ -s "$secret" ] || {{uplink}} derive-receipt-secret \
+        --node-key-file "{{state}}/config/node-{{n}}/node.key" --out "$secret"
+    echo "$secret"
+
+# Run a LEZ wallet command as an actor: deployer, oracle or node-N.
+wallet actor *args:
+    LEE_WALLET_HOME_DIR="{{state}}/wallets/{{actor}}" {{devnet_tool}} wallet {{args}}
