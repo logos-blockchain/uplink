@@ -18,7 +18,7 @@ const RESEND_AFTER: Duration = Duration::from_mins(1);
     reason = "A long-running oracle logs the failures it retries past"
 )]
 pub async fn run(
-    facade: &Referral<'_>,
+    facade: &mut Referral<'_>,
     node: &BlendNode,
     interval: Duration,
     once: bool,
@@ -42,7 +42,7 @@ pub async fn run(
 /// Publishes the node's finalized epoch if it is after the last published one and was not just
 /// sent. Returns what it published.
 async fn step(
-    facade: &Referral<'_>,
+    facade: &mut Referral<'_>,
     node: &BlendNode,
     sent: &mut Option<(Epoch, Instant)>,
 ) -> Result<Option<String>> {
