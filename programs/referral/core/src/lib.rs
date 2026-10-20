@@ -372,6 +372,11 @@ pub enum Effect {
         node: NodeId,
         points: Points,
     },
+    /// Writes an epoch's publication into its publication account, overwriting whatever is there.
+    OverwritePublication {
+        epoch: Epoch,
+        active_digest: [u8; 32],
+    },
 }
 
 /// Marks `epoch` settled in `settled`, sorted, disjoint inclusive ranges that stay merged.

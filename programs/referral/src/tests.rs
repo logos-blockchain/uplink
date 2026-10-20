@@ -117,10 +117,10 @@ fn publish_archives_the_epoch_and_replaces_the_active_set() {
         epoch: 2,
         active: active.clone(),
     };
-    let archive = Effect::Create(State::Publication {
+    let overwrite = Effect::OverwritePublication {
         epoch: 2,
         active_digest: active_digest(&active),
-    });
+    };
 
     let plan = plan_for(
         vec![meta(ORACLE_ACCOUNT_ID, true), publication(2)],
@@ -133,7 +133,7 @@ fn publish_archives_the_epoch_and_replaces_the_active_set() {
         plan.output().effects,
         vec![
             ShardEffect::new(&meta(ORACLE_ACCOUNT_ID, true), &effect),
-            ShardEffect::new(&publication(2), &archive),
+            ShardEffect::new(&publication(2), &overwrite),
         ]
     );
 
@@ -155,7 +155,7 @@ fn publish_archives_the_epoch_and_replaces_the_active_set() {
         }))
     );
     assert_eq!(
-        crate::apply(archive, &ShardData::empty()),
+        crate::apply(overwrite, &ShardData::empty()),
         Some(published(2, &active))
     );
 }
@@ -199,16 +199,92 @@ fn a_publication_must_advance_the_epoch() {
     );
 }
 
-#[test]
-#[should_panic(expected = "account already holds referral state")]
-fn an_epoch_is_published_once() {
-    let _written = crate::apply(
-        Effect::Create(State::Publication {
-            epoch: 2,
-            active_digest: [1; 32],
-        }),
-        &published(2, &BTreeSet::new()),
+/// Publishes epoch 5 over `squatted`, the note a caller created in its publication account first.
+fn publish_over(squatted: &Effect) {
+    let squatted = crate::apply(squatted.clone(), &ShardData::empty())
+        .expect("the note is created in the publication account");
+    let active = BTreeSet::from([node(1).1]);
+    assert_eq!(
+        crate::apply(
+            Effect::OverwritePublication {
+                epoch: 5,
+                active_digest: active_digest(&active),
+            },
+            &squatted,
+        ),
+        Some(published(5, &active))
     );
+}
+
+#[test]
+fn a_child_note_squatted_in_a_publication_account_is_overwritten() {
+    let (node_key, node_id) = node(1);
+    let (_, parent) = node(2);
+    let participant_account = account(11);
+
+    // Nothing ties a Register's child note to its referrer, so a future epoch's publication
+    // account can be named as one.
+    let plan = plan_for(
+        vec![
+            meta(participant_account, true),
+            meta(ORACLE_ACCOUNT_ID, false),
+            publication(5),
+        ],
+        Instruction::Register {
+            node: node_id,
+            referrer: Some(referrer(parent)),
+            node_signature: signature(&node_key, node_id, participant_account, Some(parent)),
+            pool: BTreeSet::from([parent]),
+            epoch: 3,
+        },
+    );
+    let squat = Effect::Create(State::Child {
+        node: node_id,
+        referrer: parent,
+        since: 3,
+    });
+    assert!(
+        plan.output()
+            .effects
+            .contains(&ShardEffect::new(&publication(5), &squat))
+    );
+
+    publish_over(&squat);
+}
+
+#[test]
+fn an_outgoing_credit_squatted_in_a_publication_account_is_overwritten() {
+    let (_, me) = node(1);
+    let (_, parent) = node(2);
+    let participant_account = account(20);
+    let active = BTreeSet::from([me, parent]);
+    let claim = Claim {
+        epochs: vec![epoch_claim(2, &active, vec![], 1)],
+        referrer: Some(parent),
+    };
+
+    // Nothing ties a Claim's outgoing credit to the referrer either.
+    let plan = plan_for(
+        vec![
+            meta(participant_account, true),
+            publication(2),
+            publication(5),
+        ],
+        Instruction::Claim(claim),
+    );
+    let squat = Effect::Create(State::Credit {
+        recipient_node: parent,
+        amount: 1,
+        epoch: 2,
+        active_digest: active_digest(&active),
+    });
+    assert!(
+        plan.output()
+            .effects
+            .contains(&ShardEffect::new(&publication(5), &squat))
+    );
+
+    publish_over(&squat);
 }
 
 // === Register ===
@@ -791,6 +867,31 @@ fn consume_rejects_a_note_that_differs_from_the_claim() {
             active_digest: [0; 32],
         }
         .to_data(),
+    );
+}
+
+/// A Claim consumes every note it names, so naming a publication would empty its account; the
+/// participant's side of the claim refuses it, which reverts the whole transaction.
+#[test]
+#[should_panic(expected = "note does not hold a child or a credit")]
+fn a_claim_cannot_consume_a_publication() {
+    let (_, me) = node(1);
+    let active = BTreeSet::from([me]);
+
+    let _written = crate::apply(
+        Effect::Claim(Claim {
+            epochs: vec![epoch_claim(
+                2,
+                &active,
+                vec![State::Publication {
+                    epoch: 1,
+                    active_digest: [0; 32],
+                }],
+                1,
+            )],
+            referrer: None,
+        }),
+        &State::Participant(Participant::new(me, None)).to_data(),
     );
 }
 

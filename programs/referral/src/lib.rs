@@ -27,10 +27,10 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             plan.effect(registry, &Effect::Publish { epoch, active });
             plan.effect(
                 publication,
-                &Effect::Create(State::Publication {
+                &Effect::OverwritePublication {
                     epoch,
                     active_digest: digest,
-                }),
+                },
             );
         }
         Instruction::Register {
@@ -246,6 +246,16 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
             assert!(pre_data.is_empty(), "account already holds referral state");
             Some(state.to_data())
         }
+        Effect::OverwritePublication {
+            epoch,
+            active_digest: digest,
+        } => Some(
+            State::Publication {
+                epoch,
+                active_digest: digest,
+            }
+            .to_data(),
+        ),
         Effect::Claim(claim) => {
             let mut participant = decode_participant(pre_data);
             assert_eq!(
