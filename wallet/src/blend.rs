@@ -6,8 +6,12 @@ use anyhow::{Context as _, Result};
 use lb_common_http_client::CommonHttpClient;
 use lb_core::sdp::{Declaration, DeclarationId, ServiceType};
 use lb_http_api_common::paths::MANTLE_SDP_SNAPSHOT;
-use referral_core::{Epoch, NodeId};
+use referral_core::NodeId;
 use url::Url;
+
+/// An epoch of the chain, as its slots number it. The oracle publishes once per chain epoch, but
+/// numbers its publications as Uplink epochs of its own.
+pub type ChainEpoch = u64;
 
 /// A Logos blockchain node, read over its HTTP API.
 pub struct BlendNode {
@@ -32,7 +36,7 @@ impl BlendNode {
     /// for the whole epoch, so once the last irreversible block is inside it, no reorg can change
     /// them. The snapshot is read at the tip, so the tip is read again after it: if the tip has
     /// meanwhile moved on to the next epoch, the read may be of that epoch, and it is discarded.
-    pub async fn finalized_membership(&self) -> Result<Option<(Epoch, BTreeSet<NodeId>)>> {
+    pub async fn finalized_membership(&self) -> Result<Option<(ChainEpoch, BTreeSet<NodeId>)>> {
         let slots_per_epoch = self
             .client
             .time_info(self.base_url.clone())
@@ -84,16 +88,14 @@ fn blend_members<'declaration>(
 }
 
 /// The tip's epoch, if the last irreversible block is in it too.
-fn finalized_epoch(slots_per_epoch: u64, (tip, lib): (u64, u64)) -> Result<Option<Epoch>> {
+fn finalized_epoch(slots_per_epoch: u64, (tip, lib): (u64, u64)) -> Result<Option<ChainEpoch>> {
     let epoch = epoch_of(slots_per_epoch, tip)?;
     Ok((epoch_of(slots_per_epoch, lib)? == epoch).then_some(epoch))
 }
 
-fn epoch_of(slots_per_epoch: u64, slot: u64) -> Result<Epoch> {
-    let epoch = slot
-        .checked_div(slots_per_epoch)
-        .context("the node reports epochs of no slots")?;
-    Epoch::try_from(epoch).context("the node's epoch does not fit an Uplink epoch")
+fn epoch_of(slots_per_epoch: u64, slot: u64) -> Result<ChainEpoch> {
+    slot.checked_div(slots_per_epoch)
+        .context("the node reports epochs of no slots")
 }
 
 #[cfg(test)]

@@ -145,16 +145,15 @@ enum Command {
         #[arg(value_parser = parse_reference)]
         reference: [u8; 32],
     },
-    /// Publish an epoch's active nodes. Signed by the oracle account, which this wallet must hold.
+    /// Publish the next epoch's active nodes. Signed by the oracle account, which this wallet must
+    /// hold.
     Publish {
-        #[arg(long)]
-        epoch: Epoch,
         /// Active nodes, as hex.
         #[arg(long = "active", value_parser = parse_node)]
         active: Vec<NodeId>,
     },
-    /// Run the oracle: publish the blend network's members in each chain epoch as that epoch's
-    /// active nodes, once the node finalizes the epoch. Signed by the oracle account, which this
+    /// Run the oracle: publish the blend network's members in each chain epoch, once the node
+    /// finalizes it, as the next epoch's active nodes. Signed by the oracle account, which this
     /// wallet must hold.
     Oracle {
         /// HTTP endpoint of a Logos blockchain node.
@@ -306,7 +305,13 @@ async fn run(facade: &mut Referral<'_>, command: Command) -> Result<()> {
         Command::Status { reference } => {
             println!("{:?}", facade.reconcile(reference).await?);
         }
-        Command::Publish { epoch, active } => {
+        Command::Publish { active } => {
+            let epoch = facade
+                .registry()
+                .await?
+                .epoch
+                .checked_add(1)
+                .context("every epoch has been published")?;
             let hash = facade
                 .publish(epoch, active.into_iter().collect::<BTreeSet<_>>())
                 .await?;

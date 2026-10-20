@@ -184,19 +184,38 @@ fn publish_archives_into_the_epochs_own_account() {
     );
 }
 
-#[test]
-#[should_panic(expected = "a publication must advance the epoch")]
-fn a_publication_must_advance_the_epoch() {
-    let _written = crate::apply(
+fn publish_after(registry_epoch: Epoch, epoch: Epoch) -> Option<ShardData> {
+    crate::apply(
         Effect::Publish {
-            epoch: 2,
+            epoch,
             active: BTreeSet::new(),
         },
         &registry_data(Registry {
-            epoch: 2,
+            epoch: registry_epoch,
             ..Registry::default()
         }),
-    );
+    )
+}
+
+#[test]
+fn the_first_publication_is_of_epoch_one() {
+    let written = publish_after(0, 1).expect("Publish writes the registry");
+    assert!(matches!(
+        State::decode(&written),
+        Some(State::Registry(Registry { epoch: 1, .. }))
+    ));
+}
+
+#[test]
+#[should_panic(expected = "a publication must be of the next epoch")]
+fn a_publication_cannot_repeat_the_epoch() {
+    let _written = publish_after(2, 2);
+}
+
+#[test]
+#[should_panic(expected = "a publication must be of the next epoch")]
+fn a_publication_cannot_skip_an_epoch() {
+    let _written = publish_after(2, 4);
 }
 
 /// Publishes epoch 5 over `squatted`, the note a caller created in its publication account first.

@@ -200,9 +200,12 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
     match effect {
         Effect::Publish { epoch, active } => {
             let mut registry = decode_registry(pre_data);
-            assert!(
-                epoch > registry.epoch,
-                "a publication must advance the epoch"
+            // Epochs are numbered consecutively, so no epoch is ever skipped and a mistaken epoch
+            // cannot move the registry ahead.
+            assert_eq!(
+                Some(epoch),
+                registry.epoch.checked_add(1),
+                "a publication must be of the next epoch"
             );
             registry.epoch = epoch;
             registry.active_nodes = active;

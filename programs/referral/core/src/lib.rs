@@ -23,7 +23,8 @@ const BLINDING_FACTOR_DOMAIN: &[u8; 25] = b"Uplink/BlindingFactor/v1\0";
 
 const EPOCH_DOMAIN: &[u8; 16] = b"Uplink/Epoch/v1\0";
 
-/// An epoch, numbered by the oracle's publications.
+/// An epoch, numbered consecutively by the oracle's publications from 1. It is Uplink's own and
+/// need not match the chain's epochs.
 pub type Epoch = u32;
 pub type Points = u128;
 

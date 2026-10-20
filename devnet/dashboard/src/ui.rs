@@ -196,7 +196,8 @@ fn draw_registry(frame: &mut Frame<'_>, area: Rect, lez: &Result<Lez, String>, l
     );
 }
 
-/// Blend membership by epoch: each epoch the oracle published, and the live snapshot.
+/// Blend membership by epoch: each epoch the oracle published, and the live snapshot of the chain's
+/// current epoch, which is numbered apart from the published ones.
 fn draw_publications(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, labels: &Labels) {
     let block = Block::bordered().title(" Blend membership by epoch ");
     let mut rows = Vec::new();
@@ -214,7 +215,7 @@ fn draw_publications(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, lab
             .map(|node| node.epoch(node.tip_slot));
         rows.push(
             Row::new(vec![
-                Cell::from(format!("{} live", show_option(epoch))),
+                Cell::from(format!("chain {} live", show_option(epoch))),
                 Cell::from(labelled(labels, &live)),
             ])
             .style(Style::new().fg(Color::Cyan)),
@@ -232,7 +233,7 @@ fn draw_publications(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, lab
             ]));
         }
     }
-    let table = Table::new(rows, [Constraint::Length(14), Constraint::Fill(1)])
+    let table = Table::new(rows, [Constraint::Length(18), Constraint::Fill(1)])
         .header(header(&["epoch", "members"]))
         .block(block);
     frame.render_widget(table, area);

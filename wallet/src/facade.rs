@@ -28,9 +28,13 @@ use wallet::{
     storage::key_chain::FoundPrivateAccount,
 };
 
-use crate::store::{
-    ClaimedEpoch, OperationKind, PendingOperation, PendingRegistration, Publication,
-    ReferralIntent, ReferralStore, RegistryGuard, SubmissionStatus, random_identifier,
+use crate::{
+    blend::ChainEpoch,
+    store::{
+        ClaimedEpoch, OperationKind, OraclePublication, PendingOperation, PendingRegistration,
+        Publication, ReferralIntent, ReferralStore, RegistryGuard, SubmissionStatus,
+        random_identifier,
+    },
 };
 
 const HISTORY_PAGE_LIMIT: u64 = 10;
@@ -544,6 +548,33 @@ impl<'wallet> Referral<'wallet> {
             }
         })?;
         Ok(hash)
+    }
+
+    /// The chain epoch the oracle last published from this wallet, and the epoch it published it
+    /// as.
+    #[must_use]
+    pub fn oracle_publication(&self) -> Option<OraclePublication> {
+        self.store
+            .oracle_publications
+            .get(&self.uplink_account())
+            .copied()
+    }
+
+    /// Publishes `chain_epoch`'s `active` nodes as `epoch`, recording it first so the oracle
+    /// publishes each chain epoch at most once.
+    pub async fn publish_chain_epoch(
+        &mut self,
+        chain_epoch: ChainEpoch,
+        epoch: Epoch,
+        active: BTreeSet<NodeId>,
+    ) -> Result<HashType, ExecutionFailureKind> {
+        let uplink_account = self.uplink_account();
+        self.persisted(|store| {
+            store
+                .oracle_publications
+                .insert(uplink_account, OraclePublication { chain_epoch, epoch });
+        })?;
+        self.publish(epoch, active).await
     }
 
     /// The opening of the participant's `index`-th receipt, under its node's `receipt_secret`.
