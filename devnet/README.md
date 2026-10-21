@@ -47,9 +47,10 @@ it, and the next `up` starts a new chain.
 
 ## The flow
 
-Node N's operator acts through its own wallet, `devnet/state/wallets/node-N`, and signs with its
-node's key, `devnet/state/config/node-N/node.key`, which is also its blend provider key: the oracle
-publishes nodes by that key, so it is the key a node registers under.
+Node N's operator acts through its own wallet, `devnet/state/wallets/node-N`, and signs its
+registration and the invitations it hands out with its node's key,
+`devnet/state/config/node-N/node.key`, which is also its blend provider key: the oracle publishes
+nodes by that key, so it is the key a node registers under.
 
 ```sh
 # Blend: declare nodes as blend nodes. Each joins the membership two epochs after its
