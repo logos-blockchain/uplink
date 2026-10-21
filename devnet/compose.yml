@@ -1,5 +1,8 @@
 # The uplink devnet: four Logos blockchain nodes, a LEZ sequencer and indexer on node-0, and the
 # uplink oracle. `just devnet init` writes the configs this reads from state/; see devnet/README.md.
+#
+# Ports are published on localhost only: the devnet accepts fake proofs, so anyone who can reach
+# it can submit anything.
 
 name: uplink-devnet
 
@@ -25,7 +28,7 @@ services:
       - ./state/config/node-0/config.yaml:/config/config.yaml:ro
       - ./state/config/deployment.yaml:/config/deployment.yaml:ro
       - ./state/data/node-0:/data
-    ports: ["18080:18080"]
+    ports: ["127.0.0.1:18080:18080"]
     networks: { devnet: { ipv4_address: 172.28.0.10 } }
 
   node-1:
@@ -34,7 +37,7 @@ services:
       - ./state/config/node-1/config.yaml:/config/config.yaml:ro
       - ./state/config/deployment.yaml:/config/deployment.yaml:ro
       - ./state/data/node-1:/data
-    ports: ["18081:18080"]
+    ports: ["127.0.0.1:18081:18080"]
     networks: { devnet: { ipv4_address: 172.28.0.11 } }
 
   node-2:
@@ -43,7 +46,7 @@ services:
       - ./state/config/node-2/config.yaml:/config/config.yaml:ro
       - ./state/config/deployment.yaml:/config/deployment.yaml:ro
       - ./state/data/node-2:/data
-    ports: ["18082:18080"]
+    ports: ["127.0.0.1:18082:18080"]
     networks: { devnet: { ipv4_address: 172.28.0.12 } }
 
   node-3:
@@ -52,7 +55,7 @@ services:
       - ./state/config/node-3/config.yaml:/config/config.yaml:ro
       - ./state/config/deployment.yaml:/config/deployment.yaml:ro
       - ./state/data/node-3:/data
-    ports: ["18083:18080"]
+    ports: ["127.0.0.1:18083:18080"]
     networks: { devnet: { ipv4_address: 172.28.0.13 } }
 
   # Creates the LEZ channel on node-0 and posts LEZ blocks to it, paying from the funding key
@@ -65,7 +68,7 @@ services:
     volumes:
       - ./state/config/sequencer_config.json:/config/sequencer_config.json:ro
       - ./state/data/sequencer:/var/lib/sequencer
-    ports: ["3040:3040"]
+    ports: ["127.0.0.1:3040:3040"]
     depends_on: [node-0]
     networks: { devnet: { ipv4_address: 172.28.0.20 } }
 
@@ -76,7 +79,7 @@ services:
     volumes:
       - ./lez/indexer_config.json:/config/indexer_config.json:ro
       - ./state/data/indexer:/var/lib/indexer
-    ports: ["8779:8779"]
+    ports: ["127.0.0.1:8779:8779"]
     depends_on: [node-0]
     networks: { devnet: { ipv4_address: 172.28.0.21 } }
 
