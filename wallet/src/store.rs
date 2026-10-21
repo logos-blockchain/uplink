@@ -13,12 +13,26 @@ use rand::{RngCore as _, rngs::OsRng};
 use referral_core::{Epoch, Invitation, NodeId, active_digest, ed25519_dalek::Signature};
 use serde::{Deserialize, Serialize};
 
+use crate::blend::ChainEpoch;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferralStore {
     pub intents: BTreeMap<AccountId, ReferralIntent>,
     pub operations: BTreeMap<String, PendingOperation>,
     pub publications: Vec<Publication>,
     pub history_offsets: BTreeMap<AccountId, u64>,
+    /// The last chain epoch the oracle published from this wallet, per uplink account.
+    #[serde(default)]
+    pub oracle_publications: BTreeMap<AccountId, OraclePublication>,
+}
+
+/// A chain epoch's membership the oracle published, and the epoch it published it as. Recorded
+/// before the publication is sent, so the oracle publishes each chain epoch at most once, even
+/// across restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OraclePublication {
+    pub chain_epoch: ChainEpoch,
+    pub epoch: Epoch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +262,7 @@ mod tests {
             NodeId::new([8; 32]),
             NullifierPublicKey([1; 32]),
             ViewingPublicKey::from_seed(&[2; 32], &[3; 32]),
+            Signature::from_bytes(&[4; 64]),
         ));
         store.intents.insert(participant, intent);
         store.record_operation(register_operation([7; 32], uplink_account, participant));

@@ -121,9 +121,14 @@ register n referrer="":
     referrer_args=()
     if [ -n "{{referrer}}" ]; then
         invitation="{{state}}/invitations/node-{{referrer}}.json"
+        inviter=(--participant "$({{self}} participant {{referrer}})"
+            --node "$(cat "$config/node-{{referrer}}/provider_id")")
+        invite_message="$(LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{referrer}}" {{uplink}} invite \
+            "${inviter[@]}" | tail -n1)"
+        invite_signature="$({{devnet_tool}} sign --key-file "$config/node-{{referrer}}/node.key" \
+            "$invite_message")"
         LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{referrer}}" {{uplink}} invite \
-            --participant "$({{self}} participant {{referrer}})" \
-            --node "$(cat "$config/node-{{referrer}}/provider_id")" --out "$invitation"
+            "${inviter[@]}" --signature "$invite_signature" --out "$invitation"
         LEE_WALLET_HOME_DIR="{{state}}/wallets/node-{{n}}" {{uplink}} accept-invite \
             --participant "$me" "$invitation"
         referrer_args=(--referrer "$(cat "$config/node-{{referrer}}/provider_id")")

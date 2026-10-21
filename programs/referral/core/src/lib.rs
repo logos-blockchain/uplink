@@ -17,13 +17,16 @@ pub const ORACLE_ACCOUNT_ID: AccountId = AccountId::new([
 
 const AUTHORIZATION_DOMAIN: &[u8; 31] = b"Uplink/AuthorizeParticipant/v1\0";
 
+const INVITATION_DOMAIN: &[u8; 21] = b"Uplink/Invitation/v1\0";
+
 const CASH_OUT_DOMAIN: &[u8; 18] = b"Uplink/CashOut/v1\0";
 
 const BLINDING_FACTOR_DOMAIN: &[u8; 25] = b"Uplink/BlindingFactor/v1\0";
 
 const EPOCH_DOMAIN: &[u8; 16] = b"Uplink/Epoch/v1\0";
 
-/// An epoch, numbered by the oracle's publications.
+/// An epoch, numbered consecutively by the oracle's publications from 1. It is Uplink's own and
+/// need not match the chain's epochs.
 pub type Epoch = u32;
 pub type Points = u128;
 
@@ -60,29 +63,45 @@ impl NodeId {
     }
 }
 
+/// What a referrer hands the nodes it invites: its node, the keys its children address their notes
+/// to, and its node key's signature over them, which `Register` checks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invitation {
     pub parent_node: NodeId,
     pub npk: NullifierPublicKey,
     pub vpk: ViewingPublicKey,
+    pub signature: ed25519_dalek::Signature,
 }
 
 impl Invitation {
     #[must_use]
-    pub const fn new(parent_node: NodeId, npk: NullifierPublicKey, vpk: ViewingPublicKey) -> Self {
+    pub const fn new(
+        parent_node: NodeId,
+        npk: NullifierPublicKey,
+        vpk: ViewingPublicKey,
+        signature: ed25519_dalek::Signature,
+    ) -> Self {
         Self {
             parent_node,
             npk,
             vpk,
+            signature,
         }
+    }
+
+    /// Whether the parent node's key signed this invitation for `uplink_account`.
+    #[must_use]
+    pub fn verify(&self, uplink_account: AccountId) -> bool {
+        InvitationAuthorizationV1::new(uplink_account, &self.clone().into())
+            .verify(&self.signature.to_bytes())
     }
 }
 
 /// A participant's referrer, as its `Participant` state keeps it.
 ///
 /// Holds the referrer's node and the keys the participant addresses its notes to, which a wallet
-/// restored from its mnemonic finds there. They are as the referrer's invitation gave them; the
-/// program does not authenticate them.
+/// restored from its mnemonic finds there. They are as the referrer's invitation gave them, and
+/// `Register` checks that the referrer's node key signed them.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Referrer {
     pub node: NodeId,
@@ -291,13 +310,46 @@ impl ParticipantAuthorizationV1 {
 
     #[must_use]
     pub fn verify(&self, signature: &[u8; 64]) -> bool {
-        self.node.verifying_key().is_some_and(|key| {
-            key.verify_strict(
-                &self.message(),
-                &ed25519_dalek::Signature::from_bytes(signature),
-            )
-            .is_ok()
-        })
+        verify_node_signature(self.node, &self.message(), signature)
+    }
+}
+
+/// What a referrer's node key signs to invite nodes under it: the keys its children address their
+/// notes to.
+///
+/// Without it, an invitation could name a node with keys that are not its operator's, and the node
+/// would never see its children's announcements or credits.
+///
+/// It names no invitee, so one invitation serves every node the referrer hands it to.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct InvitationAuthorizationV1 {
+    pub uplink_account: AccountId,
+    pub parent_node: NodeId,
+    pub npk: NullifierPublicKey,
+    pub vpk: ViewingPublicKey,
+}
+
+impl InvitationAuthorizationV1 {
+    #[must_use]
+    pub fn new(uplink_account: AccountId, referrer: &Referrer) -> Self {
+        Self {
+            uplink_account,
+            parent_node: referrer.node,
+            npk: referrer.npk,
+            vpk: referrer.vpk.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> Vec<u8> {
+        let mut message = INVITATION_DOMAIN.to_vec();
+        message.extend_from_slice(&borsh::to_vec(self).expect("borsh serialization is infallible"));
+        message
+    }
+
+    #[must_use]
+    pub fn verify(&self, signature: &[u8; 64]) -> bool {
+        verify_node_signature(self.parent_node, &self.message(), signature)
     }
 }
 
@@ -333,6 +385,9 @@ pub enum Instruction {
         node: NodeId,
         referrer: Option<Referrer>,
         node_signature: [u8; 64],
+        /// The referrer's node key's signature over its invitation, exactly when there is a
+        /// referrer.
+        invitation_signature: Option<[u8; 64]>,
         pool: BTreeSet<NodeId>,
         /// The registry's current epoch, which the participant and its child note record.
         epoch: Epoch,
@@ -372,6 +427,11 @@ pub enum Effect {
         node: NodeId,
         points: Points,
     },
+    /// Writes an epoch's publication into its publication account, overwriting whatever is there.
+    OverwritePublication {
+        epoch: Epoch,
+        active_digest: [u8; 32],
+    },
 }
 
 /// Marks `epoch` settled in `settled`, sorted, disjoint inclusive ranges that stay merged.
@@ -396,6 +456,13 @@ fn settle(settled: &mut Vec<(Epoch, Epoch)>, epoch: Epoch) -> bool {
     }
     *settled = merged;
     true
+}
+
+fn verify_node_signature(node: NodeId, message: &[u8], signature: &[u8; 64]) -> bool {
+    node.verifying_key().is_some_and(|key| {
+        key.verify_strict(message, &ed25519_dalek::Signature::from_bytes(signature))
+            .is_ok()
+    })
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -531,6 +598,60 @@ mod tests {
 
         let other = SigningKey::from_bytes(&[2; 32]);
         assert!(!authorization.verify(&other.sign(&authorization.message()).to_bytes()));
+    }
+
+    fn invited_by(key: &SigningKey) -> Invitation {
+        let referrer = Referrer {
+            node: NodeId::new(key.verifying_key().to_bytes()),
+            npk: NullifierPublicKey([1; 32]),
+            vpk: ViewingPublicKey::from_seed(&[2; 32], &[3; 32]),
+        };
+        let message = InvitationAuthorizationV1::new(PROGRAM, &referrer).message();
+        Invitation::new(
+            referrer.node,
+            referrer.npk,
+            referrer.vpk,
+            key.sign(&message),
+        )
+    }
+
+    #[test]
+    fn the_invitation_message_is_the_prefixed_encoding_itself() {
+        let invitation = invited_by(&SigningKey::from_bytes(&[1; 32]));
+        let message = InvitationAuthorizationV1::new(PROGRAM, &invitation.clone().into()).message();
+
+        assert_eq!(&message[..21], INVITATION_DOMAIN);
+        assert_eq!(&message[21..53], PROGRAM.as_ref());
+        assert_eq!(&message[53..85], &invitation.parent_node.to_bytes());
+    }
+
+    #[test]
+    fn an_invitation_verifies_only_as_its_parent_signed_it() {
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let invitation = invited_by(&key);
+        assert!(invitation.verify(PROGRAM));
+        assert!(
+            !invitation.verify(AccountId::new([10; 32])),
+            "an invitation is for one deployment"
+        );
+
+        let tampered = [
+            Invitation {
+                parent_node: NODE,
+                ..invitation.clone()
+            },
+            Invitation {
+                npk: NullifierPublicKey([9; 32]),
+                ..invitation.clone()
+            },
+            Invitation {
+                vpk: ViewingPublicKey::from_seed(&[4; 32], &[5; 32]),
+                ..invitation
+            },
+        ];
+        for candidate in tampered {
+            assert!(!candidate.verify(PROGRAM));
+        }
     }
 
     #[test]

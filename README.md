@@ -10,8 +10,10 @@ public receipt that only it can link to its node.
 ## Epochs and claims
 
 Each publication is archived when it is published: the epoch's active-set digest is written once to
-its own account, `epoch_account(uplink_account, epoch)`, and never changes. Epochs must increase, and each
-is published once, so the oracle cannot correct a publication.
+its own account, `epoch_account(uplink_account, epoch)`, and never changes. That account's id is
+predictable, so the archive overwrites anything a caller created in it first. Epochs are numbered
+consecutively from 1: each publication must be of the epoch after the last, so no epoch is skipped
+and none is published twice, and the oracle cannot correct a publication.
 
 A claim settles one or more published epochs in increasing order, each against its archived
 publication, so a participant that claims late is still paid for every epoch it was active in. In
@@ -20,9 +22,16 @@ for it, earning a point for each of those active in it. The total is forwarded t
 the referrer was active in that epoch. A participant keeps, per child, the epochs settled for it as
 merged ranges, so epochs can be claimed in any order and none pays a child twice.
 
+A node registers under its referrer with the referrer's invitation: the referrer's node, and the keys
+its children address their notes to, signed by the referrer's node key. Registration checks that
+signature, so an invitation cannot be altered or forged to send a node's notes to keys it does not
+hold.
+
 Registration records the registry's current epoch, and a child counts from the epoch it registered
 in: the epochs before it count as settled. Since every child registers after its referrer, nobody
-earns anything for an epoch before they registered. The wallet reads past active sets from the
+earns anything for an epoch before they registered. The wallet adopts an announced child in the
+first epoch it claims that the child is active in: until then the child pays nothing, and adopting it
+later still pays every epoch it was active in. The wallet reads past active sets from the
 indexer and checks each against its archived digest, claims epochs oldest first, and batches a
 catch-up into claims of at most 16 epochs and 2,048 active-set entries, about 2,200 guest cycles
 each.
@@ -31,15 +40,16 @@ each.
 
 The oracle publishes the blend network's membership. `uplink oracle --node <URL>` runs alongside a
 Logos blockchain node, reads its SDP snapshot, the Blend declarations active in the current chain
-epoch, and publishes their providers as that epoch's active nodes. Each node is named by its Ed25519 provider
-key, the same key that signs its registration. Uplink epoch `e` is chain epoch `e`, so anyone can
-check a publication against the chain.
+epoch, and publishes their providers as the next epoch's active nodes. Each node is named by its
+Ed25519 provider key, the same key that signs its registration. Uplink's epochs are its own and need
+not match the chain's: each chain epoch the oracle publishes becomes the next Uplink epoch.
 
-An epoch is published only once the node's last irreversible block is inside it: the ledger fixes an
-epoch's snapshot when the epoch begins, so from then on no reorg can change it. The oracle checks
-the node every few seconds and publishes each epoch once; a publication that is not included is
-sent again after a minute, and the chain rejects a second publication of an epoch. An epoch the
-oracle never publishes is skipped, and claims skip it too. `--once` checks a single time and exits.
+A chain epoch is published only once the node's last irreversible block is inside it: the ledger
+fixes an epoch's snapshot when the epoch begins, so from then on no reorg can change it. The oracle
+checks the node every few seconds and publishes each chain epoch once, recording it before sending
+so a restart does not publish it again; a publication that is not included is sent again after a
+minute, and the chain rejects any publication but the next epoch. A chain epoch the oracle misses
+is not published, but no Uplink epoch is skipped. `--once` checks a single time and exits.
 
 ```sh
 uplink --program <ID> oracle --node http://localhost:8080
@@ -82,7 +92,10 @@ just resolve-bedrock-node  # once per LEZ version: the end-to-end tests run a Be
 just test                  # everything, including the end-to-end tests
 ```
 
-Tests always run with `RISC0_DEV_MODE=1`, so they execute the guest without proving.
+Tests always run with `RISC0_DEV_MODE=1`, so they execute the guest without proving. Each end-to-end
+test runs its own Bedrock node, sequencer and indexer; run them with `-- --test-threads=1` on a
+machine that cannot run all of them at once, or the tests that read history back from the indexer
+can time out waiting for it.
 
 ## Wallet state
 

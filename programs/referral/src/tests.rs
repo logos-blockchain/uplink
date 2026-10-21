@@ -9,8 +9,9 @@ use lee_core::{
     program::{AccountMeta, Plan, PlanInput, ShardEffect},
 };
 use referral_core::{
-    Claim, Effect, Epoch, EpochClaim, Instruction, NodeId, ORACLE_ACCOUNT_ID, Participant,
-    ParticipantAuthorizationV1, Referrer, Registry, State, active_digest, cash_out_receipt,
+    Claim, Effect, Epoch, EpochClaim, Instruction, InvitationAuthorizationV1, NodeId,
+    ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1, Referrer, Registry, State,
+    active_digest, cash_out_receipt,
     ed25519_dalek::{Signer as _, SigningKey},
     epoch_account,
 };
@@ -62,6 +63,13 @@ fn signature(
 ) -> [u8; 64] {
     let authorization = ParticipantAuthorizationV1::new(PROGRAM, node, participant, referrer);
     key.sign(&authorization.message()).to_bytes()
+}
+
+/// Node `seed`'s invitation, as a referrer built by [`referrer`], signed by its node key.
+fn invited_by(seed: u8) -> [u8; 64] {
+    let (key, parent) = node(seed);
+    key.sign(&InvitationAuthorizationV1::new(PROGRAM, &referrer(parent)).message())
+        .to_bytes()
 }
 
 fn plan_for(accounts: Vec<AccountMeta>, instruction: Instruction) -> Plan {
@@ -117,10 +125,10 @@ fn publish_archives_the_epoch_and_replaces_the_active_set() {
         epoch: 2,
         active: active.clone(),
     };
-    let archive = Effect::Create(State::Publication {
+    let overwrite = Effect::OverwritePublication {
         epoch: 2,
         active_digest: active_digest(&active),
-    });
+    };
 
     let plan = plan_for(
         vec![meta(ORACLE_ACCOUNT_ID, true), publication(2)],
@@ -133,7 +141,7 @@ fn publish_archives_the_epoch_and_replaces_the_active_set() {
         plan.output().effects,
         vec![
             ShardEffect::new(&meta(ORACLE_ACCOUNT_ID, true), &effect),
-            ShardEffect::new(&publication(2), &archive),
+            ShardEffect::new(&publication(2), &overwrite),
         ]
     );
 
@@ -155,7 +163,7 @@ fn publish_archives_the_epoch_and_replaces_the_active_set() {
         }))
     );
     assert_eq!(
-        crate::apply(archive, &ShardData::empty()),
+        crate::apply(overwrite, &ShardData::empty()),
         Some(published(2, &active))
     );
 }
@@ -184,31 +192,127 @@ fn publish_archives_into_the_epochs_own_account() {
     );
 }
 
-#[test]
-#[should_panic(expected = "a publication must advance the epoch")]
-fn a_publication_must_advance_the_epoch() {
-    let _written = crate::apply(
+fn publish_after(registry_epoch: Epoch, epoch: Epoch) -> Option<ShardData> {
+    crate::apply(
         Effect::Publish {
-            epoch: 2,
+            epoch,
             active: BTreeSet::new(),
         },
         &registry_data(Registry {
-            epoch: 2,
+            epoch: registry_epoch,
             ..Registry::default()
         }),
+    )
+}
+
+#[test]
+fn the_first_publication_is_of_epoch_one() {
+    let written = publish_after(0, 1).expect("Publish writes the registry");
+    assert!(matches!(
+        State::decode(&written),
+        Some(State::Registry(Registry { epoch: 1, .. }))
+    ));
+}
+
+#[test]
+#[should_panic(expected = "a publication must be of the next epoch")]
+fn a_publication_cannot_repeat_the_epoch() {
+    let _written = publish_after(2, 2);
+}
+
+#[test]
+#[should_panic(expected = "a publication must be of the next epoch")]
+fn a_publication_cannot_skip_an_epoch() {
+    let _written = publish_after(2, 4);
+}
+
+/// Publishes epoch 5 over `squatted`, the note a caller created in its publication account first.
+fn publish_over(squatted: &Effect) {
+    let squatted = crate::apply(squatted.clone(), &ShardData::empty())
+        .expect("the note is created in the publication account");
+    let active = BTreeSet::from([node(1).1]);
+    assert_eq!(
+        crate::apply(
+            Effect::OverwritePublication {
+                epoch: 5,
+                active_digest: active_digest(&active),
+            },
+            &squatted,
+        ),
+        Some(published(5, &active))
     );
 }
 
 #[test]
-#[should_panic(expected = "account already holds referral state")]
-fn an_epoch_is_published_once() {
-    let _written = crate::apply(
-        Effect::Create(State::Publication {
-            epoch: 2,
-            active_digest: [1; 32],
-        }),
-        &published(2, &BTreeSet::new()),
+fn a_child_note_squatted_in_a_publication_account_is_overwritten() {
+    let (node_key, node_id) = node(1);
+    let (_, parent) = node(2);
+    let participant_account = account(11);
+
+    // Nothing ties a Register's child note to its referrer, so a future epoch's publication
+    // account can be named as one.
+    let plan = plan_for(
+        vec![
+            meta(participant_account, true),
+            meta(ORACLE_ACCOUNT_ID, false),
+            publication(5),
+        ],
+        Instruction::Register {
+            node: node_id,
+            referrer: Some(referrer(parent)),
+            node_signature: signature(&node_key, node_id, participant_account, Some(parent)),
+            invitation_signature: Some(invited_by(2)),
+            pool: BTreeSet::from([parent]),
+            epoch: 3,
+        },
     );
+    let squat = Effect::Create(State::Child {
+        node: node_id,
+        referrer: parent,
+        since: 3,
+    });
+    assert!(
+        plan.output()
+            .effects
+            .contains(&ShardEffect::new(&publication(5), &squat))
+    );
+
+    publish_over(&squat);
+}
+
+#[test]
+fn an_outgoing_credit_squatted_in_a_publication_account_is_overwritten() {
+    let (_, me) = node(1);
+    let (_, parent) = node(2);
+    let participant_account = account(20);
+    let active = BTreeSet::from([me, parent]);
+    let claim = Claim {
+        epochs: vec![epoch_claim(2, &active, vec![], 1)],
+        referrer: Some(parent),
+    };
+
+    // Nothing ties a Claim's outgoing credit to the referrer either.
+    let plan = plan_for(
+        vec![
+            meta(participant_account, true),
+            publication(2),
+            publication(5),
+        ],
+        Instruction::Claim(claim),
+    );
+    let squat = Effect::Create(State::Credit {
+        recipient_node: parent,
+        amount: 1,
+        epoch: 2,
+        active_digest: active_digest(&active),
+    });
+    assert!(
+        plan.output()
+            .effects
+            .contains(&ShardEffect::new(&publication(5), &squat))
+    );
+
+    publish_over(&squat);
 }
 
 // === Register ===
@@ -232,6 +336,7 @@ fn a_referred_register_announces_the_child_to_its_referrer() {
             node: node_id,
             referrer: Some(referrer(parent)),
             node_signature: signature(&node_key, node_id, participant_account, Some(parent)),
+            invitation_signature: Some(invited_by(2)),
             pool: pool.clone(),
             epoch: 3,
         },
@@ -267,6 +372,59 @@ fn a_referred_register_announces_the_child_to_its_referrer() {
     );
 }
 
+/// Plans node 1's Register under `referrer`, with `invitation_signature`.
+fn register_under(referrer: Referrer, invitation_signature: Option<[u8; 64]>) -> Plan {
+    let (node_key, node_id) = node(1);
+    let participant_account = account(11);
+    let parent = referrer.node;
+    plan_for(
+        vec![
+            meta(participant_account, true),
+            meta(ORACLE_ACCOUNT_ID, false),
+            meta(account(41), false),
+        ],
+        Instruction::Register {
+            node: node_id,
+            referrer: Some(referrer),
+            node_signature: signature(&node_key, node_id, participant_account, Some(parent)),
+            invitation_signature,
+            pool: BTreeSet::from([parent]),
+            epoch: 3,
+        },
+    )
+}
+
+#[test]
+#[should_panic(expected = "the referrer's invitation signature is invalid")]
+fn register_rejects_an_invitation_its_referrer_did_not_sign() {
+    // Node 3 signs an invitation that names node 2 as the referrer.
+    let (forger, _) = node(3);
+    let named = referrer(node(2).1);
+    let forged = forger
+        .sign(&InvitationAuthorizationV1::new(PROGRAM, &named).message())
+        .to_bytes();
+    let _plan = register_under(named, Some(forged));
+}
+
+#[test]
+#[should_panic(expected = "the referrer's invitation signature is invalid")]
+fn register_rejects_an_invitation_whose_keys_were_replaced() {
+    let (_, parent) = node(2);
+    let replaced = Referrer {
+        npk: NullifierPublicKey([99; 32]),
+        ..referrer(parent)
+    };
+    let _plan = register_under(replaced, Some(invited_by(2)));
+}
+
+#[test]
+#[should_panic(
+    expected = "a Register carries its referrer's invitation signature exactly when it has one"
+)]
+fn a_referred_register_requires_its_invitation_signature() {
+    let _plan = register_under(referrer(node(2).1), None);
+}
+
 #[test]
 #[should_panic(
     expected = "a Register announces the participant to its referrer exactly when it has one"
@@ -284,6 +442,7 @@ fn a_referred_register_requires_a_child_note_account() {
             node: node(1).1,
             referrer: Some(referrer(parent)),
             node_signature: [0; 64],
+            invitation_signature: Some(invited_by(2)),
             pool: BTreeSet::new(),
             epoch: 0,
         },
@@ -303,6 +462,7 @@ fn register_rejects_a_signature_addressed_to_another_participant() {
             node: node_id,
             referrer: None,
             node_signature: signature(&node_key, node_id, signed_for, None),
+            invitation_signature: None,
             pool: BTreeSet::new(),
             epoch: 0,
         },
@@ -328,6 +488,7 @@ fn register_requires_the_referrer_in_its_pool() {
             node: node_id,
             referrer: Some(referrer(parent)),
             node_signature: signature(&node_key, node_id, participant_account, Some(parent)),
+            invitation_signature: Some(invited_by(2)),
             pool: BTreeSet::from([other]),
             epoch: 0,
         },
@@ -791,6 +952,31 @@ fn consume_rejects_a_note_that_differs_from_the_claim() {
             active_digest: [0; 32],
         }
         .to_data(),
+    );
+}
+
+/// A Claim consumes every note it names, so naming a publication would empty its account; the
+/// participant's side of the claim refuses it, which reverts the whole transaction.
+#[test]
+#[should_panic(expected = "note does not hold a child or a credit")]
+fn a_claim_cannot_consume_a_publication() {
+    let (_, me) = node(1);
+    let active = BTreeSet::from([me]);
+
+    let _written = crate::apply(
+        Effect::Claim(Claim {
+            epochs: vec![epoch_claim(
+                2,
+                &active,
+                vec![State::Publication {
+                    epoch: 1,
+                    active_digest: [0; 32],
+                }],
+                1,
+            )],
+            referrer: None,
+        }),
+        &State::Participant(Participant::new(me, None)).to_data(),
     );
 }
 

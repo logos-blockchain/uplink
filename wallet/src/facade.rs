@@ -18,9 +18,9 @@ use lee_core::{
     program::InstructionData,
 };
 use referral_core::{
-    Claim, Effect, Epoch, EpochClaim, Instruction, Invitation, NodeId, ORACLE_ACCOUNT_ID,
-    Participant, ParticipantAuthorizationV1, Points, Referrer, Registry, State, active_digest,
-    blinding_factor, cash_out_receipt, ed25519_dalek::Signature, epoch_account,
+    Claim, Effect, Epoch, EpochClaim, Instruction, Invitation, InvitationAuthorizationV1, NodeId,
+    ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1, Points, Referrer, Registry, State,
+    active_digest, blinding_factor, cash_out_receipt, ed25519_dalek::Signature, epoch_account,
 };
 use url::Url;
 use wallet::{
@@ -28,9 +28,13 @@ use wallet::{
     storage::key_chain::FoundPrivateAccount,
 };
 
-use crate::store::{
-    ClaimedEpoch, OperationKind, PendingOperation, PendingRegistration, Publication,
-    ReferralIntent, ReferralStore, RegistryGuard, SubmissionStatus, random_identifier,
+use crate::{
+    blend::ChainEpoch,
+    store::{
+        ClaimedEpoch, OperationKind, OraclePublication, PendingOperation, PendingRegistration,
+        Publication, ReferralIntent, ReferralStore, RegistryGuard, SubmissionStatus,
+        random_identifier,
+    },
 };
 
 const HISTORY_PAGE_LIMIT: u64 = 10;
@@ -186,16 +190,43 @@ impl<'wallet> Referral<'wallet> {
             .map(|operation| operation.status)
     }
 
+    /// What `node`'s key signs to invite nodes under this participant: the participant's keys,
+    /// which the nodes it invites address their notes to.
+    pub fn invitation_authorization(
+        &self,
+        participant: AccountId,
+        node: NodeId,
+    ) -> Result<InvitationAuthorizationV1, ExecutionFailureKind> {
+        let found = self.found(participant)?;
+        Ok(InvitationAuthorizationV1::new(
+            self.uplink_account(),
+            &Referrer {
+                node,
+                npk: found.key_chain.nullifier_public_key,
+                vpk: found.key_chain.viewing_public_key.clone(),
+            },
+        ))
+    }
+
+    /// The invitation for nodes joining under this participant's `node`, with `node`'s key's
+    /// `signature` over [`Self::invitation_authorization`].
     pub fn invitation(
         &self,
         participant: AccountId,
         node: NodeId,
+        signature: [u8; 64],
     ) -> Result<Invitation, ExecutionFailureKind> {
-        let found = self.found(participant)?;
+        let authorization = self.invitation_authorization(participant, node)?;
+        if !authorization.verify(&signature) {
+            return Err(conflict(
+                "the signature is not the node's over this invitation",
+            ));
+        }
         Ok(Invitation::new(
             node,
-            found.key_chain.nullifier_public_key,
-            found.key_chain.viewing_public_key.clone(),
+            authorization.npk,
+            authorization.vpk,
+            Signature::from_bytes(&signature),
         ))
     }
 
@@ -204,6 +235,11 @@ impl<'wallet> Referral<'wallet> {
         participant: AccountId,
         invitation: Invitation,
     ) -> Result<(), ExecutionFailureKind> {
+        if !invitation.verify(self.uplink_account()) {
+            return Err(conflict(
+                "the invitation is not signed by its referrer's node",
+            ));
+        }
         let parent = invitation.parent_node;
         let mut intent = self
             .intent(participant)
@@ -546,6 +582,33 @@ impl<'wallet> Referral<'wallet> {
         Ok(hash)
     }
 
+    /// The chain epoch the oracle last published from this wallet, and the epoch it published it
+    /// as.
+    #[must_use]
+    pub fn oracle_publication(&self) -> Option<OraclePublication> {
+        self.store
+            .oracle_publications
+            .get(&self.uplink_account())
+            .copied()
+    }
+
+    /// Publishes `chain_epoch`'s `active` nodes as `epoch`, recording it first so the oracle
+    /// publishes each chain epoch at most once.
+    pub async fn publish_chain_epoch(
+        &mut self,
+        chain_epoch: ChainEpoch,
+        epoch: Epoch,
+        active: BTreeSet<NodeId>,
+    ) -> Result<HashType, ExecutionFailureKind> {
+        let uplink_account = self.uplink_account();
+        self.persisted(|store| {
+            store
+                .oracle_publications
+                .insert(uplink_account, OraclePublication { chain_epoch, epoch });
+        })?;
+        self.publish(epoch, active).await
+    }
+
     /// The opening of the participant's `index`-th receipt, under its node's `receipt_secret`.
     pub fn opening(
         &self,
@@ -805,7 +868,7 @@ impl<'wallet> Referral<'wallet> {
         participant: AccountId,
     ) -> Result<Request, ExecutionFailureKind> {
         let uplink_account = self.uplink_account();
-        let (node, referrer, node_signature) = self
+        let (node, parent, node_signature) = self
             .pending_registration(participant)
             .and_then(|pending| Some((pending.node, pending.referrer, pending.signed()?)))
             .ok_or_else(|| conflict("this participant has no signed registration"))?;
@@ -813,23 +876,26 @@ impl<'wallet> Referral<'wallet> {
         if registry.registered_nodes.contains(&node) {
             return Err(conflict("this node is already registered"));
         }
-        if referrer.is_some_and(|parent| !registry.registered_nodes.contains(&parent)) {
+        if parent.is_some_and(|referrer| !registry.registered_nodes.contains(&referrer)) {
             return Err(conflict("the referrer is not registered"));
         }
 
         // The participant's state keeps the referrer's keys, so later claims address the
         // referrer without the invitation.
-        let referrer = referrer
-            .map(|parent| {
+        let invitation = parent
+            .map(|referrer| {
                 self.intent(participant)
                     .and_then(|intent| intent.invitation.clone())
-                    .filter(|invitation| invitation.parent_node == parent)
-                    .map(Referrer::from)
+                    .filter(|invitation| invitation.parent_node == referrer)
                     .ok_or_else(|| {
                         conflict("the referrer's invitation is needed to address its note")
                     })
             })
             .transpose()?;
+        let invitation_signature = invitation
+            .as_ref()
+            .map(|invitation| invitation.signature.to_bytes());
+        let referrer = invitation.map(Referrer::from);
 
         let mut accounts = vec![
             self.own_private(participant)?
@@ -844,6 +910,7 @@ impl<'wallet> Referral<'wallet> {
                 node,
                 referrer,
                 node_signature,
+                invitation_signature,
                 pool: registry.registered_nodes,
                 epoch: registry.epoch,
             }),
@@ -1166,8 +1233,11 @@ fn earliest_claimable(claimant: &Participant, notes: &[(AccountId, State)]) -> O
 }
 
 /// Plans the participant's claims over `published` epochs, oldest first: each epoch that would pay,
-/// with the credits earned in it, its active set's size and what it pays. Announced children go
-/// with the first epoch planned.
+/// with the notes it consumes, its active set's size and what it pays.
+///
+/// An announced child is adopted in the first epoch planned that it is active in, from its
+/// registration on. Until then it would pay nothing, and adopting it later still pays every epoch
+/// it was active in, so a child that is never active is never adopted and costs the claims nothing.
 ///
 /// Simulates the claims with the program's own [`Participant::claim`], so each total is what the
 /// program will compute.
@@ -1176,17 +1246,10 @@ fn plan_epochs(
     notes: Vec<(AccountId, State)>,
     published: BTreeMap<Epoch, BTreeSet<NodeId>>,
 ) -> Vec<(ClaimedEpoch, usize, Points)> {
-    // Announced children are adopted in the first epoch claimed, so simulate them adopted from the
-    // start: an epoch before the first one claimed pays nothing either way.
-    let (children, credits): (Vec<_>, Vec<_>) = notes
+    let (mut waiting, credits): (Vec<_>, Vec<_>) = notes
         .into_iter()
         .partition(|(_id, state)| matches!(state, State::Child { .. }));
     let mut simulated = claimant.clone();
-    for (_id, child) in &children {
-        if let State::Child { node, since, .. } = *child {
-            simulated.adopt(node, since);
-        }
-    }
 
     let mut planned: Vec<(ClaimedEpoch, usize, Points)> = Vec::new();
     for (epoch, active) in published {
@@ -1194,13 +1257,22 @@ fn plan_epochs(
             continue;
         }
         let digest = active_digest(&active);
-        let (ids, states): (Vec<AccountId>, Vec<State>) = credits
-            .iter()
-            .filter(|(_id, state)| {
-                matches!(*state, State::Credit { epoch: earned, active_digest: under, .. }
-                    if (earned, under) == (epoch, digest))
-            })
-            .cloned()
+        let adopted;
+        (adopted, waiting) = waiting.into_iter().partition(|(_id, state)| {
+            matches!(*state, State::Child { node, since, .. }
+                if since <= epoch && active.contains(&node))
+        });
+        let (ids, states): (Vec<AccountId>, Vec<State>) = adopted
+            .into_iter()
+            .chain(
+                credits
+                    .iter()
+                    .filter(|(_id, state)| {
+                        matches!(*state, State::Credit { epoch: earned, active_digest: under, .. }
+                            if (earned, under) == (epoch, digest))
+                    })
+                    .cloned(),
+            )
             .unzip();
         let entries = active.len();
         let total = simulated.claim(&EpochClaim {
@@ -1220,11 +1292,6 @@ fn plan_epochs(
                 total,
             ));
         }
-    }
-    if let Some((first, _entries, _total)) = planned.first_mut() {
-        first
-            .notes
-            .splice(0..0, children.iter().map(|(id, _state)| *id));
     }
     planned
 }
@@ -1651,8 +1718,95 @@ mod tests {
         nodes.iter().copied().collect()
     }
 
+    fn announced(id: u8, node: NodeId, since: Epoch) -> (AccountId, State) {
+        (
+            AccountId::new([id; 32]),
+            State::Child {
+                node,
+                referrer: ME,
+                since,
+            },
+        )
+    }
+
+    /// The notes `plan_epochs` puts in each epoch it plans, by epoch.
+    fn planned_notes(
+        claimant: &Participant,
+        notes: Vec<(AccountId, State)>,
+        published: BTreeMap<Epoch, BTreeSet<NodeId>>,
+    ) -> Vec<(Epoch, Vec<AccountId>)> {
+        plan_epochs(claimant, notes, published)
+            .into_iter()
+            .map(|(claimed, _entries, _total)| (claimed.epoch, claimed.notes))
+            .collect()
+    }
+
     #[test]
-    fn the_planner_keeps_only_paying_epochs_and_adopts_announcements_in_the_first() {
+    fn a_child_that_is_never_active_is_never_adopted() {
+        let (a, spam) = (NodeId::new([1; 32]), NodeId::new([2; 32]));
+        let notes = vec![announced(11, a, 1), announced(12, spam, 1)];
+        let published = (1..=3).map(|epoch| (epoch, active(&[ME, a]))).collect();
+
+        assert_eq!(
+            planned_notes(&Participant::new(ME, None), notes, published),
+            vec![
+                (1, vec![AccountId::new([11; 32])]),
+                (2, Vec::new()),
+                (3, Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_is_adopted_in_the_first_epoch_it_is_active_in() {
+        let (a, b) = (NodeId::new([1; 32]), NodeId::new([2; 32]));
+        // `a` already pays every epoch; `b` only becomes active in epoch 3.
+        let claimant = Participant {
+            children: BTreeMap::from([(a, Vec::new())]),
+            ..Participant::new(ME, None)
+        };
+        let published = BTreeMap::from([
+            (1, active(&[ME, a])),
+            (2, active(&[ME, a])),
+            (3, active(&[ME, a, b])),
+        ]);
+
+        assert_eq!(
+            planned_notes(&claimant, vec![announced(12, b, 1)], published),
+            vec![
+                (1, Vec::new()),
+                (2, Vec::new()),
+                (3, vec![AccountId::new([12; 32])]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_adopted_late_is_paid_for_the_epochs_already_claimed_it_was_active_in() {
+        let (a, b) = (NodeId::new([1; 32]), NodeId::new([2; 32]));
+        // Epochs 1 to 3 were claimed for `a` before `b`, active in epoch 2 only, was adopted.
+        let claimant = Participant {
+            children: BTreeMap::from([(a, vec![(0, 3)])]),
+            ..Participant::new(ME, None)
+        };
+        let published = BTreeMap::from([
+            (1, active(&[ME, a])),
+            (2, active(&[ME, a, b])),
+            (3, active(&[ME, a])),
+        ]);
+
+        let planned = plan_epochs(&claimant, vec![announced(12, b, 1)], published);
+        assert_eq!(
+            planned
+                .iter()
+                .map(|(claimed, _entries, total)| (claimed.epoch, claimed.notes.clone(), *total))
+                .collect::<Vec<_>>(),
+            vec![(2, vec![AccountId::new([12; 32])], 1)]
+        );
+    }
+
+    #[test]
+    fn the_planner_keeps_only_paying_epochs_and_adopts_a_child_in_the_first_it_is_active_in() {
         let a = NodeId::new([1; 32]);
         let third = active(&[ME, a]);
         let (announcement, credit) = (AccountId::new([11; 32]), AccountId::new([12; 32]));

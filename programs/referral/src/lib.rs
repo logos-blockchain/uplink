@@ -4,8 +4,9 @@ use lee_core::{
 };
 pub use referral_core as core;
 use referral_core::{
-    Claim, Effect, Instruction, ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1, Points,
-    Registry, State, active_digest, cash_out_receipt, epoch_account,
+    Claim, Effect, Instruction, InvitationAuthorizationV1, ORACLE_ACCOUNT_ID, Participant,
+    ParticipantAuthorizationV1, Points, Registry, State, active_digest, cash_out_receipt,
+    epoch_account,
 };
 
 pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
@@ -27,16 +28,17 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             plan.effect(registry, &Effect::Publish { epoch, active });
             plan.effect(
                 publication,
-                &Effect::Create(State::Publication {
+                &Effect::OverwritePublication {
                     epoch,
                     active_digest: digest,
-                }),
+                },
             );
         }
         Instruction::Register {
             node,
             referrer,
             node_signature,
+            invitation_signature,
             pool,
             epoch,
         } => {
@@ -54,6 +56,18 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             );
             assert_authorized(participant);
             assert_registry(registry);
+            assert_eq!(
+                referrer.is_some(),
+                invitation_signature.is_some(),
+                "a Register carries its referrer's invitation signature exactly when it has one"
+            );
+            if let Some((referrer, signature)) = referrer.as_ref().zip(invitation_signature) {
+                assert!(
+                    InvitationAuthorizationV1::new(input.self_account_id, referrer)
+                        .verify(&signature),
+                    "the referrer's invitation signature is invalid"
+                );
+            }
             let parent = referrer.as_ref().map(|referrer| referrer.node);
             if let Some(parent) = parent {
                 assert!(pool.contains(&parent), "the pool must contain the referrer");
@@ -200,9 +214,12 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
     match effect {
         Effect::Publish { epoch, active } => {
             let mut registry = decode_registry(pre_data);
-            assert!(
-                epoch > registry.epoch,
-                "a publication must advance the epoch"
+            // Epochs are numbered consecutively, so no epoch is ever skipped and a mistaken epoch
+            // cannot move the registry ahead.
+            assert_eq!(
+                Some(epoch),
+                registry.epoch.checked_add(1),
+                "a publication must be of the next epoch"
             );
             registry.epoch = epoch;
             registry.active_nodes = active;
@@ -246,6 +263,16 @@ pub fn apply(effect: Effect, pre_data: &ShardData) -> Option<ShardData> {
             assert!(pre_data.is_empty(), "account already holds referral state");
             Some(state.to_data())
         }
+        Effect::OverwritePublication {
+            epoch,
+            active_digest: digest,
+        } => Some(
+            State::Publication {
+                epoch,
+                active_digest: digest,
+            }
+            .to_data(),
+        ),
         Effect::Claim(claim) => {
             let mut participant = decode_participant(pre_data);
             assert_eq!(

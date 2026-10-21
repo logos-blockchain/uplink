@@ -60,13 +60,18 @@ enum Command {
         #[arg(long)]
         participant: AccountId,
     },
-    /// Write an invitation for a node joining under this participant's node.
+    /// Write an invitation for nodes joining under this participant's node. Without a signature,
+    /// print the message the node key must sign; with the node key's signature over it, write the
+    /// invitation.
     Invite {
         #[arg(long)]
         participant: AccountId,
         /// This participant's node, as hex.
         #[arg(long, value_parser = parse_node)]
         node: NodeId,
+        /// The node key's Ed25519 signature over the invitation's message, as hex.
+        #[arg(long, value_parser = parse_signature)]
+        signature: Option<[u8; 64]>,
         /// File to write the invitation to; printed if omitted.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -145,16 +150,15 @@ enum Command {
         #[arg(value_parser = parse_reference)]
         reference: [u8; 32],
     },
-    /// Publish an epoch's active nodes. Signed by the oracle account, which this wallet must hold.
+    /// Publish the next epoch's active nodes. Signed by the oracle account, which this wallet must
+    /// hold.
     Publish {
-        #[arg(long)]
-        epoch: Epoch,
         /// Active nodes, as hex.
         #[arg(long = "active", value_parser = parse_node)]
         active: Vec<NodeId>,
     },
-    /// Run the oracle: publish the blend network's members in each chain epoch as that epoch's
-    /// active nodes, once the node finalizes the epoch. Signed by the oracle account, which this
+    /// Run the oracle: publish the blend network's members in each chain epoch, once the node
+    /// finalizes it, as the next epoch's active nodes. Signed by the oracle account, which this
     /// wallet must hold.
     Oracle {
         /// HTTP endpoint of a Logos blockchain node.
@@ -219,9 +223,20 @@ async fn run(facade: &mut Referral<'_>, command: Command) -> Result<()> {
         Command::Invite {
             participant,
             node,
+            signature: None,
+            ..
+        } => {
+            let authorization = facade.invitation_authorization(participant, node)?;
+            println!("{}", hex::encode(authorization.message()));
+        }
+        Command::Invite {
+            participant,
+            node,
+            signature: Some(signature),
             out,
         } => {
-            let invitation = serde_json::to_string_pretty(&facade.invitation(participant, node)?)?;
+            let invitation =
+                serde_json::to_string_pretty(&facade.invitation(participant, node, signature)?)?;
             match out {
                 Some(path) => fs::write(&path, invitation)
                     .with_context(|| format!("Failed to write {}", path.display()))?,
@@ -306,7 +321,13 @@ async fn run(facade: &mut Referral<'_>, command: Command) -> Result<()> {
         Command::Status { reference } => {
             println!("{:?}", facade.reconcile(reference).await?);
         }
-        Command::Publish { epoch, active } => {
+        Command::Publish { active } => {
+            let epoch = facade
+                .registry()
+                .await?
+                .epoch
+                .checked_add(1)
+                .context("every epoch has been published")?;
             let hash = facade
                 .publish(epoch, active.into_iter().collect::<BTreeSet<_>>())
                 .await?;
