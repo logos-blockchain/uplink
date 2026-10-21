@@ -1197,8 +1197,11 @@ fn earliest_claimable(claimant: &Participant, notes: &[(AccountId, State)]) -> O
 }
 
 /// Plans the participant's claims over `published` epochs, oldest first: each epoch that would pay,
-/// with the credits earned in it, its active set's size and what it pays. Announced children go
-/// with the first epoch planned.
+/// with the notes it consumes, its active set's size and what it pays.
+///
+/// An announced child is adopted in the first epoch planned that it is active in, from its
+/// registration on. Until then it would pay nothing, and adopting it later still pays every epoch
+/// it was active in, so a child that is never active is never adopted and costs the claims nothing.
 ///
 /// Simulates the claims with the program's own [`Participant::claim`], so each total is what the
 /// program will compute.
@@ -1207,17 +1210,10 @@ fn plan_epochs(
     notes: Vec<(AccountId, State)>,
     published: BTreeMap<Epoch, BTreeSet<NodeId>>,
 ) -> Vec<(ClaimedEpoch, usize, Points)> {
-    // Announced children are adopted in the first epoch claimed, so simulate them adopted from the
-    // start: an epoch before the first one claimed pays nothing either way.
-    let (children, credits): (Vec<_>, Vec<_>) = notes
+    let (mut waiting, credits): (Vec<_>, Vec<_>) = notes
         .into_iter()
         .partition(|(_id, state)| matches!(state, State::Child { .. }));
     let mut simulated = claimant.clone();
-    for (_id, child) in &children {
-        if let State::Child { node, since, .. } = *child {
-            simulated.adopt(node, since);
-        }
-    }
 
     let mut planned: Vec<(ClaimedEpoch, usize, Points)> = Vec::new();
     for (epoch, active) in published {
@@ -1225,13 +1221,22 @@ fn plan_epochs(
             continue;
         }
         let digest = active_digest(&active);
-        let (ids, states): (Vec<AccountId>, Vec<State>) = credits
-            .iter()
-            .filter(|(_id, state)| {
-                matches!(*state, State::Credit { epoch: earned, active_digest: under, .. }
-                    if (earned, under) == (epoch, digest))
-            })
-            .cloned()
+        let adopted;
+        (adopted, waiting) = waiting.into_iter().partition(|(_id, state)| {
+            matches!(*state, State::Child { node, since, .. }
+                if since <= epoch && active.contains(&node))
+        });
+        let (ids, states): (Vec<AccountId>, Vec<State>) = adopted
+            .into_iter()
+            .chain(
+                credits
+                    .iter()
+                    .filter(|(_id, state)| {
+                        matches!(*state, State::Credit { epoch: earned, active_digest: under, .. }
+                            if (earned, under) == (epoch, digest))
+                    })
+                    .cloned(),
+            )
             .unzip();
         let entries = active.len();
         let total = simulated.claim(&EpochClaim {
@@ -1251,11 +1256,6 @@ fn plan_epochs(
                 total,
             ));
         }
-    }
-    if let Some((first, _entries, _total)) = planned.first_mut() {
-        first
-            .notes
-            .splice(0..0, children.iter().map(|(id, _state)| *id));
     }
     planned
 }
@@ -1682,8 +1682,95 @@ mod tests {
         nodes.iter().copied().collect()
     }
 
+    fn announced(id: u8, node: NodeId, since: Epoch) -> (AccountId, State) {
+        (
+            AccountId::new([id; 32]),
+            State::Child {
+                node,
+                referrer: ME,
+                since,
+            },
+        )
+    }
+
+    /// The notes `plan_epochs` puts in each epoch it plans, by epoch.
+    fn planned_notes(
+        claimant: &Participant,
+        notes: Vec<(AccountId, State)>,
+        published: BTreeMap<Epoch, BTreeSet<NodeId>>,
+    ) -> Vec<(Epoch, Vec<AccountId>)> {
+        plan_epochs(claimant, notes, published)
+            .into_iter()
+            .map(|(claimed, _entries, _total)| (claimed.epoch, claimed.notes))
+            .collect()
+    }
+
     #[test]
-    fn the_planner_keeps_only_paying_epochs_and_adopts_announcements_in_the_first() {
+    fn a_child_that_is_never_active_is_never_adopted() {
+        let (a, spam) = (NodeId::new([1; 32]), NodeId::new([2; 32]));
+        let notes = vec![announced(11, a, 1), announced(12, spam, 1)];
+        let published = (1..=3).map(|epoch| (epoch, active(&[ME, a]))).collect();
+
+        assert_eq!(
+            planned_notes(&Participant::new(ME, None), notes, published),
+            vec![
+                (1, vec![AccountId::new([11; 32])]),
+                (2, Vec::new()),
+                (3, Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_is_adopted_in_the_first_epoch_it_is_active_in() {
+        let (a, b) = (NodeId::new([1; 32]), NodeId::new([2; 32]));
+        // `a` already pays every epoch; `b` only becomes active in epoch 3.
+        let claimant = Participant {
+            children: BTreeMap::from([(a, Vec::new())]),
+            ..Participant::new(ME, None)
+        };
+        let published = BTreeMap::from([
+            (1, active(&[ME, a])),
+            (2, active(&[ME, a])),
+            (3, active(&[ME, a, b])),
+        ]);
+
+        assert_eq!(
+            planned_notes(&claimant, vec![announced(12, b, 1)], published),
+            vec![
+                (1, Vec::new()),
+                (2, Vec::new()),
+                (3, vec![AccountId::new([12; 32])]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_adopted_late_is_paid_for_the_epochs_already_claimed_it_was_active_in() {
+        let (a, b) = (NodeId::new([1; 32]), NodeId::new([2; 32]));
+        // Epochs 1 to 3 were claimed for `a` before `b`, active in epoch 2 only, was adopted.
+        let claimant = Participant {
+            children: BTreeMap::from([(a, vec![(0, 3)])]),
+            ..Participant::new(ME, None)
+        };
+        let published = BTreeMap::from([
+            (1, active(&[ME, a])),
+            (2, active(&[ME, a, b])),
+            (3, active(&[ME, a])),
+        ]);
+
+        let planned = plan_epochs(&claimant, vec![announced(12, b, 1)], published);
+        assert_eq!(
+            planned
+                .iter()
+                .map(|(claimed, _entries, total)| (claimed.epoch, claimed.notes.clone(), *total))
+                .collect::<Vec<_>>(),
+            vec![(2, vec![AccountId::new([12; 32])], 1)]
+        );
+    }
+
+    #[test]
+    fn the_planner_keeps_only_paying_epochs_and_adopts_a_child_in_the_first_it_is_active_in() {
         let a = NodeId::new([1; 32]);
         let third = active(&[ME, a]);
         let (announcement, credit) = (AccountId::new([11; 32]), AccountId::new([12; 32]));
