@@ -18,9 +18,9 @@ use lee_core::{
     program::InstructionData,
 };
 use referral_core::{
-    Claim, Effect, Epoch, EpochClaim, Instruction, Invitation, NodeId, ORACLE_ACCOUNT_ID,
-    Participant, ParticipantAuthorizationV1, Points, Referrer, Registry, State, active_digest,
-    blinding_factor, cash_out_receipt, ed25519_dalek::Signature, epoch_account,
+    Claim, Effect, Epoch, EpochClaim, Instruction, Invitation, InvitationAuthorizationV1, NodeId,
+    ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1, Points, Referrer, Registry, State,
+    active_digest, blinding_factor, cash_out_receipt, ed25519_dalek::Signature, epoch_account,
 };
 use url::Url;
 use wallet::{
@@ -190,16 +190,43 @@ impl<'wallet> Referral<'wallet> {
             .map(|operation| operation.status)
     }
 
+    /// What `node`'s key signs to invite nodes under this participant: the participant's keys,
+    /// which the nodes it invites address their notes to.
+    pub fn invitation_authorization(
+        &self,
+        participant: AccountId,
+        node: NodeId,
+    ) -> Result<InvitationAuthorizationV1, ExecutionFailureKind> {
+        let found = self.found(participant)?;
+        Ok(InvitationAuthorizationV1::new(
+            self.uplink_account(),
+            &Referrer {
+                node,
+                npk: found.key_chain.nullifier_public_key,
+                vpk: found.key_chain.viewing_public_key.clone(),
+            },
+        ))
+    }
+
+    /// The invitation for nodes joining under this participant's `node`, with `node`'s key's
+    /// `signature` over [`Self::invitation_authorization`].
     pub fn invitation(
         &self,
         participant: AccountId,
         node: NodeId,
+        signature: [u8; 64],
     ) -> Result<Invitation, ExecutionFailureKind> {
-        let found = self.found(participant)?;
+        let authorization = self.invitation_authorization(participant, node)?;
+        if !authorization.verify(&signature) {
+            return Err(conflict(
+                "the signature is not the node's over this invitation",
+            ));
+        }
         Ok(Invitation::new(
             node,
-            found.key_chain.nullifier_public_key,
-            found.key_chain.viewing_public_key.clone(),
+            authorization.npk,
+            authorization.vpk,
+            Signature::from_bytes(&signature),
         ))
     }
 
@@ -208,6 +235,11 @@ impl<'wallet> Referral<'wallet> {
         participant: AccountId,
         invitation: Invitation,
     ) -> Result<(), ExecutionFailureKind> {
+        if !invitation.verify(self.uplink_account()) {
+            return Err(conflict(
+                "the invitation is not signed by its referrer's node",
+            ));
+        }
         let parent = invitation.parent_node;
         let mut intent = self
             .intent(participant)
@@ -836,7 +868,7 @@ impl<'wallet> Referral<'wallet> {
         participant: AccountId,
     ) -> Result<Request, ExecutionFailureKind> {
         let uplink_account = self.uplink_account();
-        let (node, referrer, node_signature) = self
+        let (node, parent, node_signature) = self
             .pending_registration(participant)
             .and_then(|pending| Some((pending.node, pending.referrer, pending.signed()?)))
             .ok_or_else(|| conflict("this participant has no signed registration"))?;
@@ -844,23 +876,26 @@ impl<'wallet> Referral<'wallet> {
         if registry.registered_nodes.contains(&node) {
             return Err(conflict("this node is already registered"));
         }
-        if referrer.is_some_and(|parent| !registry.registered_nodes.contains(&parent)) {
+        if parent.is_some_and(|referrer| !registry.registered_nodes.contains(&referrer)) {
             return Err(conflict("the referrer is not registered"));
         }
 
         // The participant's state keeps the referrer's keys, so later claims address the
         // referrer without the invitation.
-        let referrer = referrer
-            .map(|parent| {
+        let invitation = parent
+            .map(|referrer| {
                 self.intent(participant)
                     .and_then(|intent| intent.invitation.clone())
-                    .filter(|invitation| invitation.parent_node == parent)
-                    .map(Referrer::from)
+                    .filter(|invitation| invitation.parent_node == referrer)
                     .ok_or_else(|| {
                         conflict("the referrer's invitation is needed to address its note")
                     })
             })
             .transpose()?;
+        let invitation_signature = invitation
+            .as_ref()
+            .map(|invitation| invitation.signature.to_bytes());
+        let referrer = invitation.map(Referrer::from);
 
         let mut accounts = vec![
             self.own_private(participant)?
@@ -875,6 +910,7 @@ impl<'wallet> Referral<'wallet> {
                 node,
                 referrer,
                 node_signature,
+                invitation_signature,
                 pool: registry.registered_nodes,
                 epoch: registry.epoch,
             }),

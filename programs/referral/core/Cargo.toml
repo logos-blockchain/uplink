@@ -11,5 +11,5 @@ workspace = true
 lee_core.workspace = true
 borsh.workspace = true
 serde.workspace = true
-ed25519-dalek.workspace = true
+ed25519-dalek = { workspace = true, features = ["serde"] }
 risc0-zkvm.workspace = true

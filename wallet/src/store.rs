@@ -262,6 +262,7 @@ mod tests {
             NodeId::new([8; 32]),
             NullifierPublicKey([1; 32]),
             ViewingPublicKey::from_seed(&[2; 32], &[3; 32]),
+            Signature::from_bytes(&[4; 64]),
         ));
         store.intents.insert(participant, intent);
         store.record_operation(register_operation([7; 32], uplink_account, participant));

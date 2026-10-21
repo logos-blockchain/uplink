@@ -60,13 +60,18 @@ enum Command {
         #[arg(long)]
         participant: AccountId,
     },
-    /// Write an invitation for a node joining under this participant's node.
+    /// Write an invitation for nodes joining under this participant's node. Without a signature,
+    /// print the message the node key must sign; with the node key's signature over it, write the
+    /// invitation.
     Invite {
         #[arg(long)]
         participant: AccountId,
         /// This participant's node, as hex.
         #[arg(long, value_parser = parse_node)]
         node: NodeId,
+        /// The node key's Ed25519 signature over the invitation's message, as hex.
+        #[arg(long, value_parser = parse_signature)]
+        signature: Option<[u8; 64]>,
         /// File to write the invitation to; printed if omitted.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -218,9 +223,20 @@ async fn run(facade: &mut Referral<'_>, command: Command) -> Result<()> {
         Command::Invite {
             participant,
             node,
+            signature: None,
+            ..
+        } => {
+            let authorization = facade.invitation_authorization(participant, node)?;
+            println!("{}", hex::encode(authorization.message()));
+        }
+        Command::Invite {
+            participant,
+            node,
+            signature: Some(signature),
             out,
         } => {
-            let invitation = serde_json::to_string_pretty(&facade.invitation(participant, node)?)?;
+            let invitation =
+                serde_json::to_string_pretty(&facade.invitation(participant, node, signature)?)?;
             match out {
                 Some(path) => fs::write(&path, invitation)
                     .with_context(|| format!("Failed to write {}", path.display()))?,

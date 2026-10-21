@@ -115,6 +115,19 @@ fn node(seed: u8) -> (SigningKey, NodeId) {
     (key, id)
 }
 
+/// `participant`'s invitation for nodes joining under it, signed by its node's key.
+fn invite(
+    ctx: &mut TestContext,
+    program: AccountId,
+    participant: AccountId,
+    node_key: &SigningKey,
+) -> Result<Invitation> {
+    let node = NodeId::new(node_key.verifying_key().to_bytes());
+    let authorization = facade(ctx, program).invitation_authorization(participant, node)?;
+    let signature = node_key.sign(&authorization.message()).to_bytes();
+    Ok(facade(ctx, program).invitation(participant, node, signature)?)
+}
+
 async fn register(
     ctx: &mut TestContext,
     program: AccountId,
@@ -302,7 +315,7 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
     let dave = facade(&mut ctx, program).create_participant()?;
 
     register(&mut ctx, program, carol, &carol_key, None, None).await?;
-    let carol_invites_alice = facade(&mut ctx, program).invitation(carol, carol_node)?;
+    let carol_invites_alice = invite(&mut ctx, program, carol, &carol_key)?;
     register(
         &mut ctx,
         program,
@@ -312,7 +325,7 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
         Some(carol_invites_alice),
     )
     .await?;
-    let alice_invites_bob = facade(&mut ctx, program).invitation(alice, alice_node)?;
+    let alice_invites_bob = invite(&mut ctx, program, alice, &alice_key)?;
     register(
         &mut ctx,
         program,
@@ -423,7 +436,7 @@ async fn the_worked_example_pays_one_per_active_child_through_real_wallets() -> 
         "the chain paid her for her child and for her child's child"
     );
 
-    let carol_invites_dave = facade(&mut ctx, program).invitation(carol, carol_node)?;
+    let carol_invites_dave = invite(&mut ctx, program, carol, &carol_key)?;
     register(
         &mut ctx,
         program,
@@ -497,7 +510,7 @@ async fn registration_bookkeeping_resumes_and_refuses_conflicts() -> Result<()> 
     let program = deploy_referral(&mut ctx, payer.account_id).await?;
 
     let (bob_key, bob_node) = node(1);
-    let (_alice_key, alice_node) = node(2);
+    let (alice_key, alice_node) = node(2);
     let bob = facade(&mut ctx, program).create_participant()?;
     let stranger = facade(&mut ctx, program).create_participant()?;
 
@@ -538,7 +551,7 @@ async fn registration_bookkeeping_resumes_and_refuses_conflicts() -> Result<()> 
         "another deployment with the same node is a conflict: {other_deployment:?}"
     );
 
-    let stranger_invitation = facade(&mut ctx, program).invitation(stranger, alice_node)?;
+    let stranger_invitation = invite(&mut ctx, program, stranger, &alice_key)?;
     let foreign = facade(&mut ctx, program).import_invitation(bob, stranger_invitation);
     assert!(
         foreign.is_err(),
@@ -592,7 +605,7 @@ async fn a_slack_referrer_catches_up_in_one_claim_from_each_childs_registration(
     let alice = facade(&mut ctx, program).create_participant()?;
     let dave = facade(&mut ctx, program).create_participant()?;
     register(&mut ctx, program, carol, &carol_key, None, None).await?;
-    let carol_invites_alice = facade(&mut ctx, program).invitation(carol, carol_node)?;
+    let carol_invites_alice = invite(&mut ctx, program, carol, &carol_key)?;
     register(
         &mut ctx,
         program,
@@ -613,7 +626,7 @@ async fn a_slack_referrer_catches_up_in_one_claim_from_each_childs_registration(
         )
         .await?;
     }
-    let carol_invites_dave = facade(&mut ctx, program).invitation(carol, carol_node)?;
+    let carol_invites_dave = invite(&mut ctx, program, carol, &carol_key)?;
     register(
         &mut ctx,
         program,
@@ -663,7 +676,7 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
     let alice = facade(&mut ctx, program).create_participant()?;
     let bob = facade(&mut ctx, program).create_participant()?;
     register(&mut ctx, program, carol, &carol_key, None, None).await?;
-    let carol_invites_alice = facade(&mut ctx, program).invitation(carol, carol_node)?;
+    let carol_invites_alice = invite(&mut ctx, program, carol, &carol_key)?;
     register(
         &mut ctx,
         program,
@@ -673,7 +686,7 @@ async fn cash_out_receipts_survive_a_mnemonic_only_restore() -> Result<()> {
         Some(carol_invites_alice),
     )
     .await?;
-    let alice_invites_bob = facade(&mut ctx, program).invitation(alice, alice_node)?;
+    let alice_invites_bob = invite(&mut ctx, program, alice, &alice_key)?;
     register(
         &mut ctx,
         program,
@@ -799,7 +812,7 @@ async fn late_epochs_still_pay_and_each_credit_is_redeemed_once() -> Result<()> 
     let chris = facade(&mut ctx, program).create_participant()?;
     let dan = facade(&mut ctx, program).create_participant()?;
     register(&mut ctx, program, bob, &bob_key, None, None).await?;
-    let bob_invites_alice = facade(&mut ctx, program).invitation(bob, bob_node)?;
+    let bob_invites_alice = invite(&mut ctx, program, bob, &bob_key)?;
     register(
         &mut ctx,
         program,
@@ -809,7 +822,7 @@ async fn late_epochs_still_pay_and_each_credit_is_redeemed_once() -> Result<()> 
         Some(bob_invites_alice),
     )
     .await?;
-    let alice_invites_chris = facade(&mut ctx, program).invitation(alice, alice_node)?;
+    let alice_invites_chris = invite(&mut ctx, program, alice, &alice_key)?;
     register(
         &mut ctx,
         program,
@@ -845,7 +858,7 @@ async fn late_epochs_still_pay_and_each_credit_is_redeemed_once() -> Result<()> 
     );
 
     // Dan registers under Alice during epoch 3, after Alice already claimed it.
-    let alice_invites_dan = facade(&mut ctx, program).invitation(alice, alice_node)?;
+    let alice_invites_dan = invite(&mut ctx, program, alice, &alice_key)?;
     register(
         &mut ctx,
         program,

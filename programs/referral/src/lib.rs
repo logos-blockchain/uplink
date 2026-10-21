@@ -4,8 +4,9 @@ use lee_core::{
 };
 pub use referral_core as core;
 use referral_core::{
-    Claim, Effect, Instruction, ORACLE_ACCOUNT_ID, Participant, ParticipantAuthorizationV1, Points,
-    Registry, State, active_digest, cash_out_receipt, epoch_account,
+    Claim, Effect, Instruction, InvitationAuthorizationV1, ORACLE_ACCOUNT_ID, Participant,
+    ParticipantAuthorizationV1, Points, Registry, State, active_digest, cash_out_receipt,
+    epoch_account,
 };
 
 pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
@@ -37,6 +38,7 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             node,
             referrer,
             node_signature,
+            invitation_signature,
             pool,
             epoch,
         } => {
@@ -54,6 +56,18 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             );
             assert_authorized(participant);
             assert_registry(registry);
+            assert_eq!(
+                referrer.is_some(),
+                invitation_signature.is_some(),
+                "a Register carries its referrer's invitation signature exactly when it has one"
+            );
+            if let Some((referrer, signature)) = referrer.as_ref().zip(invitation_signature) {
+                assert!(
+                    InvitationAuthorizationV1::new(input.self_account_id, referrer)
+                        .verify(&signature),
+                    "the referrer's invitation signature is invalid"
+                );
+            }
             let parent = referrer.as_ref().map(|referrer| referrer.node);
             if let Some(parent) = parent {
                 assert!(pool.contains(&parent), "the pool must contain the referrer");
